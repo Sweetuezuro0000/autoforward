@@ -1,32 +1,30 @@
 import asyncio
+
+# Python 3.10+ / 3.14 asyncio event loop fix
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
 import os
+import random
 import sqlite3
 import threading
-import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from pyrogram import Client, filters
 from pyrogram.enums import ChatMemberStatus
-from pyrogram.errors import FloodWait, RPCError
+from pyrogram.errors import FloodWait
 from pyrogram.types import Message
 
 
 # =========================================================
-# ENVIRONMENT
+# CREDENTIALS
 # =========================================================
 
-API_ID = int(os.environ.get("API_ID", "0"))
+API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 SESSION_STRING = os.environ.get("SESSION_STRING", "")
-
-print(f"API_ID present: {bool(API_ID)}")
-print(f"API_HASH present: {bool(API_HASH)}")
-print(f"SESSION_STRING present: {bool(SESSION_STRING)}")
-
-
-# =========================================================
-# PYROGRAM CLIENT
-# =========================================================
 
 app = Client(
     "userbot_session",
@@ -37,14 +35,13 @@ app = Client(
 
 
 # =========================================================
-# RENDER HEALTH SERVER
+# DUMMY WEB SERVER
 # =========================================================
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
         self.end_headers()
         self.wfile.write(b"Userbot is running perfectly!")
 
@@ -53,20 +50,9 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 
 
 def start_dummy_server():
-    try:
-        port = int(os.environ.get("PORT", "10000"))
-
-        server = HTTPServer(
-            ("0.0.0.0", port),
-            HealthCheckHandler
-        )
-
-        print(f"Health server started on port {port}")
-
-        server.serve_forever()
-
-    except Exception as e:
-        print(f"[Health Server Error] {e}")
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
 
 
 threading.Thread(
@@ -79,114 +65,78 @@ threading.Thread(
 # DATABASE
 # =========================================================
 
-DB_FILE = "userbot_data.db"
-
 conn = sqlite3.connect(
-    DB_FILE,
-    check_same_thread=False,
-    timeout=30
+    "userbot_data.db",
+    check_same_thread=False
 )
 
-db_lock = threading.RLock()
+cursor = conn.cursor()
+db_lock = threading.Lock()
 
 with db_lock:
+    cursor.execute(
+        "CREATE TABLE IF NOT EXISTS chats "
+        "(chat_id TEXT PRIMARY KEY, title TEXT)"
+    )
 
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
+    cursor.execute(
+        "CREATE TABLE IF NOT EXISTS config "
+        "(key TEXT PRIMARY KEY, value TEXT)"
+    )
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS chats (
-            chat_id TEXT PRIMARY KEY,
-            title TEXT
-        )
-    """)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS config (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS stats (
-            key TEXT PRIMARY KEY,
-            value INTEGER
-        )
-    """)
+    cursor.execute(
+        "CREATE TABLE IF NOT EXISTS stats "
+        "(key TEXT PRIMARY KEY, value INTEGER)"
+    )
 
     conn.commit()
 
-print("SQLite database initialized")
-
-
-# =========================================================
-# DATABASE FUNCTIONS
-# =========================================================
 
 def get_config(key, default=""):
-
     with db_lock:
-
-        cur = conn.execute(
+        cursor.execute(
             "SELECT value FROM config WHERE key=?",
             (key,)
         )
+        res = cursor.fetchone()
 
-        row = cur.fetchone()
-
-        return row[0] if row else default
+    return res[0] if res else default
 
 
 def set_config(key, value):
-
     with db_lock:
-
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO config
-            (key, value)
-            VALUES (?, ?)
-            """,
+        cursor.execute(
+            "INSERT OR REPLACE INTO config (key, value) "
+            "VALUES (?, ?)",
             (key, str(value))
         )
-
         conn.commit()
 
 
 def get_stat(key):
-
     with db_lock:
-
-        cur = conn.execute(
+        cursor.execute(
             "SELECT value FROM stats WHERE key=?",
             (key,)
         )
+        res = cursor.fetchone()
 
-        row = cur.fetchone()
-
-        return int(row[0]) if row else 0
+    return res[0] if res else 0
 
 
 def inc_stat(key, amount=1):
-
     with db_lock:
-
-        cur = conn.execute(
+        cursor.execute(
             "SELECT value FROM stats WHERE key=?",
             (key,)
         )
 
-        row = cur.fetchone()
+        res = cursor.fetchone()
+        current = res[0] if res else 0
 
-        current = int(row[0]) if row else 0
-
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO stats
-            (key, value)
-            VALUES (?, ?)
-            """,
+        cursor.execute(
+            "INSERT OR REPLACE INTO stats (key, value) "
+            "VALUES (?, ?)",
             (key, current + amount)
         )
 
@@ -194,55 +144,48 @@ def inc_stat(key, amount=1):
 
 
 def get_all_chats():
-
     with db_lock:
-
-        cur = conn.execute(
-            "SELECT chat_id, title FROM chats ORDER BY rowid"
+        cursor.execute(
+            "SELECT chat_id, title FROM chats"
         )
+        return cursor.fetchall()
 
-        return cur.fetchall()
 
-
-def add_chat_db(chat_id, title):
-
+def add_db_chat(chat_id, title):
     with db_lock:
-
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO chats
-            (chat_id, title)
-            VALUES (?, ?)
-            """,
+        cursor.execute(
+            "INSERT OR REPLACE INTO chats "
+            "(chat_id, title) VALUES (?, ?)",
             (chat_id, title)
         )
-
         conn.commit()
 
 
-def delete_chat_db(chat_id):
-
+def delete_db_chat(chat_id):
     with db_lock:
-
-        cur = conn.execute(
+        cursor.execute(
             "DELETE FROM chats WHERE chat_id=?",
             (chat_id,)
         )
 
+        deleted = cursor.rowcount
         conn.commit()
 
-        return cur.rowcount
+    return deleted
 
 
 # =========================================================
-# DEFAULT CONFIG
+# DEFAULTS
 # =========================================================
 
 if not get_config("status"):
     set_config("status", "OFF")
 
 if not get_config("delay"):
-    set_config("delay", "30")
+    set_config("delay", "8")
+
+if not get_config("cycle_delay"):
+    set_config("cycle_delay", "15")
 
 if not get_config("msg"):
     set_config("msg", "Default Auto Message")
@@ -263,12 +206,15 @@ async def is_force_sub_active():
         return True
 
     try:
-
         if "t.me/" in channel:
-            channel = channel.split("t.me/", 1)[1]
+            channel = channel.split("t.me/")[1]
 
-        channel = channel.replace("/", "")
-        channel = channel.replace("@", "").strip()
+        channel = (
+            channel
+            .replace("/", "")
+            .replace("@", "")
+            .strip()
+        )
 
         me = await app.get_me()
 
@@ -277,263 +223,265 @@ async def is_force_sub_active():
             me.id
         )
 
-        if member.status in (
+        if member.status in [
             ChatMemberStatus.OWNER,
             ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.MEMBER
-        ):
+            ChatMemberStatus.MEMBER,
+        ]:
             return True
 
         return False
 
     except Exception as e:
-
-        print(f"[ForceSub API Error] {e}")
-
         # API error ko "not joined" mat samjho
+        print(f"[ForceSub API Error] {e}")
         return None
 
 
 # =========================================================
-# AUTO BROADCAST
+# AUTO BROADCASTER
 # =========================================================
-
-broadcast_task = None
-
 
 async def auto_broadcast_loop():
 
-    print("Auto broadcaster started")
-
     while True:
 
-        try:
+        await asyncio.sleep(2)
 
-            await asyncio.sleep(2)
+        if get_config("status") != "ON":
+            continue
 
-            if get_config("status") != "ON":
-                continue
+        force_status = await is_force_sub_active()
 
-            force_status = await is_force_sub_active()
+        # Sirf confirmed non-member hone par OFF karo
+        if force_status is False:
 
-            # Actual membership failure
-            if force_status is False:
-
-                set_config("status", "OFF")
-
-                try:
-                    await app.send_message(
-                        "me",
-                        "❌ **Auto Msg Stopped!**\n"
-                        "Force Sub channel se aap member nahi ho."
-                    )
-                except Exception:
-                    pass
-
-                continue
-
-            # Telegram/API temporary error
-            if force_status is None:
-                print("[ForceSub] Check failed, auto messaging kept ON")
-                continue
-
-            chats = get_all_chats()
-            msg_text = get_config("msg")
-            delay_text = get_config("delay", "30")
+            set_config("status", "OFF")
 
             try:
-                delay = max(1, int(delay_text))
-            except ValueError:
-                delay = 30
+                await app.send_message(
+                    "me",
+                    f"❌ **Auto Msg Stopped!**\n"
+                    f"Force Sub Channel "
+                    f"(@{get_config('force_sub')}) "
+                    f"leave kar diya gaya hai."
+                )
+            except Exception as e:
+                print(f"[Notify Error] {e}")
 
-            if not chats:
-                continue
+            continue
 
-            if not msg_text:
-                continue
+        # API error hua to auto msg band mat karo
+        if force_status is None:
+            await asyncio.sleep(10)
+            continue
 
-            for chat_id, title in chats:
+        chats = get_all_chats()
 
-                if get_config("status") != "ON":
-                    break
+        msg_text = get_config(
+            "msg",
+            "Default Auto Message"
+        )
 
-                try:
+        try:
+            group_gap = max(
+                1,
+                int(get_config("delay", "8"))
+            )
 
-                    if chat_id.lstrip("-").isdigit():
-                        target = int(chat_id)
-                    else:
-                        target = chat_id
+            cycle_minutes = max(
+                0,
+                int(get_config("cycle_delay", "15"))
+            )
 
-                    await app.send_message(
-                        target,
-                        msg_text
-                    )
+        except ValueError:
+            group_gap = 8
+            cycle_minutes = 15
 
-                    inc_stat("total_sent")
-                    inc_stat("success_sent")
+        if not chats or not msg_text:
+            continue
 
-                    print(
-                        f"[SENT] {title} ({chat_id})"
-                    )
+        # =================================================
+        # ROUND START
+        # =================================================
 
-                    await asyncio.sleep(delay)
+        for chat_id, title in chats:
 
-                except FloodWait as e:
+            if get_config("status") != "ON":
+                break
 
-                    print(
-                        f"[FloodWait] {chat_id}: "
-                        f"waiting {e.value}s"
-                    )
+            try:
 
-                    await asyncio.sleep(e.value)
+                target = (
+                    int(chat_id)
+                    if chat_id.lstrip("-").isdigit()
+                    else chat_id
+                )
 
-                    # FloodWait ke baad isi chat ko retry
-                    try:
+                await app.send_message(
+                    target,
+                    msg_text
+                )
 
-                        await app.send_message(
-                            target,
-                            msg_text
-                        )
+                inc_stat("total_sent")
+                inc_stat("success_sent")
 
-                        inc_stat("total_sent")
-                        inc_stat("success_sent")
+                print(
+                    f"[Sent] {title} ({chat_id})"
+                )
 
-                        print(
-                            f"[RETRY SENT] {title} ({chat_id})"
-                        )
+            except FloodWait as e:
 
-                    except Exception as retry_error:
+                print(
+                    f"[FloodWait] Sleeping {e.value}s"
+                )
 
-                        inc_stat("failed_sent")
+                await asyncio.sleep(e.value)
 
-                        print(
-                            f"[Retry Error] "
-                            f"{chat_id}: {retry_error}"
-                        )
+            except Exception as e:
 
-                    await asyncio.sleep(delay)
+                inc_stat("total_sent")
+                inc_stat("failed_sent")
 
-                except Exception as e:
+                print(
+                    f"[Send Error] "
+                    f"{chat_id}: {e}"
+                )
 
-                    inc_stat("total_sent")
-                    inc_stat("failed_sent")
+            # Human-like random delay
+            randomized_gap = random.randint(
+                max(3, group_gap - 2),
+                group_gap + 4
+            )
 
-                    print(
-                        f"[Send Error] "
-                        f"{chat_id}: {e}"
-                    )
+            await asyncio.sleep(
+                randomized_gap
+            )
 
-        except asyncio.CancelledError:
+        # =================================================
+        # ROUND BREAK
+        # =================================================
 
-            print("Auto broadcaster stopped")
+        if get_config("status") == "ON":
 
-            raise
+            print(
+                f"[Cycle Done] "
+                f"Resting for {cycle_minutes} minutes..."
+            )
 
-        except Exception as e:
-
-            print(f"[Broadcast Loop Error] {e}")
-
-            traceback.print_exc()
-
-            await asyncio.sleep(5)
+            await asyncio.sleep(
+                cycle_minutes * 60
+            )
 
 
 # =========================================================
-# COMMAND DEBUG
+# COMMAND HANDLERS
 # =========================================================
 
-@app.on_message(
-    filters.outgoing &
-    filters.regex(r"^\.[A-Za-z0-9_]+")
-)
-async def command_debug(client, message: Message):
-
-    print(
-        f"[COMMAND RECEIVED] "
-        f"text={message.text!r} "
-        f"chat_id={message.chat.id if message.chat else None} "
-        f"outgoing={message.outgoing}"
-    )
-
-
-# =========================================================
 # .addchat
-# =========================================================
+# No argument = current chat
+# .addchat @username
+# .addchat -1001234567890
+# .addchat t.me/username
 
 @app.on_message(
     filters.outgoing &
     filters.command("addchat", prefixes=".")
 )
-async def add_chat_handler(client, message: Message):
+async def add_chat_handler(
+    client,
+    message: Message
+):
 
-    print(f"[CMD] addchat -> {message.text}")
-
-    args = message.text.split(maxsplit=1)
+    args = message.text.split(
+        maxsplit=1
+    )
 
     if len(args) < 2:
 
-        return await message.edit_text(
-            "❌ **Usage:** `.addchat <chat_id/@username>`"
-        )
+        target = message.chat.id
 
-    target = args[1].strip()
+    else:
+
+        target_str = args[1].strip()
+
+        if "t.me/" in target_str:
+
+            target_str = (
+                target_str
+                .split("t.me/")[1]
+                .replace("/", "")
+                .replace("+", "")
+            )
+
+        if target_str.lstrip("-").isdigit():
+
+            target = int(target_str)
+
+        else:
+
+            target = (
+                target_str
+                if target_str.startswith("@")
+                else f"@{target_str}"
+            )
 
     try:
 
-        chat_obj = await client.get_chat(target)
+        chat_obj = await client.get_chat(
+            target
+        )
 
         chat_id = str(chat_obj.id)
 
         title = (
             chat_obj.title
             or chat_obj.first_name
-            or chat_obj.username
             or "Unknown"
         )
 
-        add_chat_db(
+        add_db_chat(
             chat_id,
             title
         )
 
         await message.edit_text(
-            f"✅ **Chat Added!**\n\n"
+            f"✅ **Chat Added!**\n"
             f"📌 **Title:** `{title}`\n"
             f"🆔 **ID:** `{chat_id}`"
         )
 
     except Exception as e:
 
-        print(f"[addchat Error] {e}")
-
         await message.edit_text(
-            f"❌ **Error:** `{str(e)[:3000]}`"
+            f"❌ **Error:** `{e}`"
         )
 
 
-# =========================================================
 # .delchat
-# =========================================================
 
 @app.on_message(
     filters.outgoing &
     filters.command("delchat", prefixes=".")
 )
-async def del_chat_handler(client, message: Message):
+async def del_chat_handler(
+    client,
+    message: Message
+):
 
-    print(f"[CMD] delchat -> {message.text}")
+    args = message.text.split(
+        maxsplit=1
+    )
 
-    args = message.text.split(maxsplit=1)
+    chat_id = (
+        str(message.chat.id)
+        if len(args) < 2
+        else args[1].strip()
+    )
 
-    if len(args) < 2:
-
-        return await message.edit_text(
-            "❌ **Usage:** `.delchat <chat_id>`"
-        )
-
-    chat_id = args[1].strip()
-
-    deleted = delete_chat_db(chat_id)
+    deleted = delete_db_chat(
+        chat_id
+    )
 
     if deleted:
 
@@ -544,75 +492,43 @@ async def del_chat_handler(client, message: Message):
     else:
 
         await message.edit_text(
-            f"ℹ️ Chat `{chat_id}` list me nahi mila."
+            f"ℹ️ **Chat `{chat_id}` list mein nahi hai.**"
         )
 
 
-# =========================================================
 # .listchats
-# =========================================================
 
 @app.on_message(
     filters.outgoing &
     filters.command("listchats", prefixes=".")
 )
-async def list_chats_handler(client, message: Message):
-
-    print(f"[CMD] listchats -> {message.text}")
+async def list_chats_handler(
+    client,
+    message: Message
+):
 
     chats = get_all_chats()
 
     if not chats:
 
         return await message.edit_text(
-            "ℹ️ Koi chat added nahi hai."
+            "ℹ️ No chats added."
         )
 
-    text = "📋 **Target Chats List:**\n\n"
+    text = "📋 **Target Chats:**\n\n"
 
-    for idx, (chat_id, title) in enumerate(chats, 1):
+    for idx, (c_id, title) in enumerate(
+        chats,
+        1
+    ):
 
         line = (
-            f"{idx}. **{title}**\n"
-            f"   `{chat_id}`\n\n"
+            f"{idx}. **{title}** | `{c_id}`\n"
         )
 
-        if len(text) + len(line) > 3800:
+        if len(text) + len(line) > 4000:
 
             await message.edit_text(text)
-
-            # Agar bahut zyada chats hain
-            # remaining data Saved Messages me bhej do
-            remaining = (
-                "📋 **More Target Chats:**\n\n"
-                + line
-            )
-
-            for idx2, (cid, ttl) in enumerate(
-                chats[idx:],
-                idx + 1
-            ):
-
-                remaining += (
-                    f"{idx2}. **{ttl}**\n"
-                    f"   `{cid}`\n\n"
-                )
-
-                if len(remaining) > 3800:
-
-                    await client.send_message(
-                        "me",
-                        remaining
-                    )
-
-                    remaining = ""
-
-            if remaining:
-
-                await client.send_message(
-                    "me",
-                    remaining
-                )
 
             return
 
@@ -621,127 +537,147 @@ async def list_chats_handler(client, message: Message):
     await message.edit_text(text)
 
 
-# =========================================================
 # .setmsg
-# =========================================================
 
 @app.on_message(
     filters.outgoing &
     filters.command("setmsg", prefixes=".")
 )
-async def set_msg_handler(client, message: Message):
+async def set_msg_handler(
+    client,
+    message: Message
+):
 
-    print(f"[CMD] setmsg -> {message.text}")
-
-    args = message.text.split(maxsplit=1)
+    args = message.text.split(
+        maxsplit=1
+    )
 
     if len(args) < 2:
 
         return await message.edit_text(
-            "❌ **Usage:** `.setmsg <your message>`"
+            "❌ `.setmsg <text>`"
         )
 
-    new_msg = args[1]
-
-    if len(new_msg) > 4096:
+    if len(args[1]) > 4096:
 
         return await message.edit_text(
-            "❌ Message 4096 characters se zyada nahi ho sakta."
+            "❌ Message 4096 characters se chhota rakho."
         )
 
     set_config(
         "msg",
-        new_msg
+        args[1]
     )
-
-    preview = new_msg[:3000]
 
     await message.edit_text(
-        f"✅ **Auto Message Updated!**\n\n"
-        f"📝 **New Msg:**\n{preview}"
+        "✅ **Message Updated!**"
     )
 
 
-# =========================================================
 # .setdelay
-# =========================================================
 
 @app.on_message(
     filters.outgoing &
     filters.command("setdelay", prefixes=".")
 )
-async def set_delay_handler(client, message: Message):
+async def set_delay_handler(
+    client,
+    message: Message
+):
 
-    print(f"[CMD] setdelay -> {message.text}")
+    args = message.text.split(
+        maxsplit=1
+    )
 
-    args = message.text.split(maxsplit=1)
-
-    if len(args) < 2:
-
-        return await message.edit_text(
-            "❌ **Usage:** `.setdelay <seconds>`"
-        )
-
-    value = args[1].strip()
-
-    if not value.isdigit():
-
-        return await message.edit_text(
-            "❌ Delay sirf number hona chahiye."
-        )
-
-    seconds = int(value)
-
-    if seconds < 1:
+    if (
+        len(args) < 2
+        or not args[1].isdigit()
+        or int(args[1]) < 1
+    ):
 
         return await message.edit_text(
-            "❌ Minimum delay **1 second** hai."
+            "❌ `.setdelay <seconds>`\n"
+            "(Groups ke beech ka gap)"
         )
+
+    delay = int(args[1])
 
     set_config(
         "delay",
-        str(seconds)
+        delay
     )
 
     await message.edit_text(
-        f"⏱ **Delay set to `{seconds}` seconds.**"
+        f"⏱ **Group Gap set to `{delay}s`** "
+        f"(with random variation)"
     )
 
 
-# =========================================================
+# .setcycle
+
+@app.on_message(
+    filters.outgoing &
+    filters.command("setcycle", prefixes=".")
+)
+async def set_cycle_handler(
+    client,
+    message: Message
+):
+
+    args = message.text.split(
+        maxsplit=1
+    )
+
+    if (
+        len(args) < 2
+        or not args[1].isdigit()
+    ):
+
+        return await message.edit_text(
+            "❌ `.setcycle <minutes>` "
+            "(Round break time)"
+        )
+
+    minutes = int(args[1])
+
+    set_config(
+        "cycle_delay",
+        minutes
+    )
+
+    await message.edit_text(
+        f"🔄 **Round Break set to "
+        f"`{minutes}` minutes.**"
+    )
+
+
 # .forcesub
-# =========================================================
 
 @app.on_message(
     filters.outgoing &
     filters.command("forcesub", prefixes=".")
 )
-async def set_forcesub_handler(client, message: Message):
+async def set_forcesub_handler(
+    client,
+    message: Message
+):
 
-    print(f"[CMD] forcesub -> {message.text}")
-
-    args = message.text.split(maxsplit=1)
+    args = message.text.split(
+        maxsplit=1
+    )
 
     if len(args) < 2:
 
         return await message.edit_text(
-            "❌ **Usage:** `.forcesub <channel_username>`"
+            "❌ `.forcesub <channel_username>`"
         )
 
-    ch = args[1].strip()
-
-    if "t.me/" in ch:
-
-        ch = ch.split("t.me/", 1)[1]
-
-    ch = ch.replace("/", "")
-    ch = ch.replace("@", "").strip()
-
-    if not ch:
-
-        return await message.edit_text(
-            "❌ Invalid channel."
-        )
+    ch = (
+        args[1]
+        .replace("@", "")
+        .replace("t.me/", "")
+        .strip()
+    )
 
     set_config(
         "force_sub",
@@ -749,52 +685,56 @@ async def set_forcesub_handler(client, message: Message):
     )
 
     await message.edit_text(
-        f"🔒 **Force Sub Channel set to:** `@{ch}`"
+        f"🔒 **Force Sub set to:** `@{ch}`"
     )
 
 
-# =========================================================
 # .automsg
-# =========================================================
 
 @app.on_message(
     filters.outgoing &
     filters.command("automsg", prefixes=".")
 )
-async def toggle_automsg(client, message: Message):
+async def toggle_automsg(
+    client,
+    message: Message
+):
 
-    print(f"[CMD] automsg -> {message.text}")
-
-    args = message.text.split(maxsplit=1)
+    args = message.text.split(
+        maxsplit=1
+    )
 
     if (
         len(args) < 2
-        or args[1].lower() not in ("on", "off")
+        or args[1].lower()
+        not in ["on", "off"]
     ):
 
         return await message.edit_text(
-            "❌ **Usage:** `.automsg on` ya `.automsg off`"
+            "❌ `.automsg on` ya `.automsg off`"
         )
 
     state = args[1].upper()
 
     if state == "ON":
 
-        force_status = await is_force_sub_active()
+        force_status = (
+            await is_force_sub_active()
+        )
 
         if force_status is False:
 
             return await message.edit_text(
-                "❌ **Cannot Start!**\n"
-                f"Pehle `@{get_config('force_sub')}` "
-                "channel join karein."
+                f"❌ Join "
+                f"@{get_config('force_sub')} "
+                f"first!"
             )
 
         if force_status is None:
 
             return await message.edit_text(
-                "⚠️ Force Sub check nahi ho paya.\n"
-                "Thodi der baad dobara try karo."
+                "⚠️ Force Sub check abhi fail ho rahi hai. "
+                "Thodi der baad try karo."
             )
 
     set_config(
@@ -803,53 +743,45 @@ async def toggle_automsg(client, message: Message):
     )
 
     await message.edit_text(
-        f"🤖 **Auto Messaging is now switched `{state}`!**"
+        f"🤖 **Auto Messaging is `{state}`!**"
     )
 
 
-# =========================================================
 # .stats
-# =========================================================
 
 @app.on_message(
     filters.outgoing &
     filters.command("stats", prefixes=".")
 )
-async def stats_handler(client, message: Message):
-
-    print(f"[CMD] stats -> {message.text}")
-
-    status = get_config("status")
-    delay = get_config("delay")
-    force_sub = get_config("force_sub") or "None"
-
-    chats = get_all_chats()
-
-    total = get_stat("total_sent")
-    success = get_stat("success_sent")
-    failed = get_stat("failed_sent")
-
-    msg = get_config("msg")
-
-    if len(msg) > 1000:
-        msg = msg[:1000] + "..."
+async def stats_handler(
+    client,
+    message: Message
+):
 
     stats_text = (
-        "📊 **Auto-Bot Dashboard & Stats**\n"
+        "📊 **Auto-Bot Anti-Spam Dashboard**\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚡ **Status:** `{status}`\n"
-        f"⏱ **Delay:** `{delay}s`\n"
-        f"🔒 **Force Sub:** `@{force_sub}`\n"
-        f"🎯 **Target Chats:** `{len(chats)}`\n\n"
+        f"⚡ **Status:** `{get_config('status')}`\n"
+        f"⏱ **Group Gap:** ~`{get_config('delay')}s` "
+        f"(Randomized)\n"
+        f"🔄 **Round Break:** "
+        f"`{get_config('cycle_delay')} mins`\n"
+        f"🔒 **Force Sub:** "
+        f"`@{get_config('force_sub') or 'None'}`\n"
+        f"🎯 **Target Chats:** "
+        f"`{len(get_all_chats())} Groups`\n\n"
         "📈 **Sending History:**\n"
-        f"├ 🚀 **Total Attempts:** `{total}`\n"
-        f"├ ✅ **Successfully Sent:** `{success}`\n"
-        f"└ ❌ **Failed:** `{failed}`\n\n"
-        "📝 **Current Active Message:**\n"
-        f"`{msg}`"
+        f"├ 🚀 **Total Attempts:** "
+        f"`{get_stat('total_sent')}`\n"
+        f"├ ✅ **Successfully Sent:** "
+        f"`{get_stat('success_sent')}`\n"
+        f"└ ❌ **Failed:** "
+        f"`{get_stat('failed_sent')}`"
     )
 
-    await message.edit_text(stats_text)
+    await message.edit_text(
+        stats_text
+    )
 
 
 # =========================================================
@@ -858,77 +790,24 @@ async def stats_handler(client, message: Message):
 
 async def main():
 
-    global broadcast_task
+    await app.start()
 
-    try:
+    print(
+        "Userbot started with "
+        "Anti-Spam Protection!"
+    )
 
-        print("Starting Pyrogram client...")
+    asyncio.create_task(
+        auto_broadcast_loop()
+    )
 
-        await app.start()
+    await asyncio.Event().wait()
 
-        me = await app.get_me()
-
-        print(
-            f"Login successful: "
-            f"user_id={me.id}, "
-            f"username=@{me.username or 'none'}"
-        )
-
-        if broadcast_task is None or broadcast_task.done():
-
-            broadcast_task = asyncio.create_task(
-                auto_broadcast_loop()
-            )
-
-            print("Background broadcaster created")
-
-        print("====================================")
-        print("USERBOT IS FULLY RUNNING")
-        print("Commands use filters.outgoing")
-        print("====================================")
-
-        await asyncio.Event().wait()
-
-    except Exception as e:
-
-        print(f"[MAIN ERROR] {e}")
-
-        traceback.print_exc()
-
-        raise
-
-    finally:
-
-        if broadcast_task:
-
-            broadcast_task.cancel()
-
-            try:
-                await broadcast_task
-            except asyncio.CancelledError:
-                pass
-
-        try:
-            await app.stop()
-        except Exception:
-            pass
-
-
-# =========================================================
-# START
-# =========================================================
 
 if __name__ == "__main__":
 
-    try:
+    loop = asyncio.get_event_loop()
 
-        asyncio.run(main())
-
-    except KeyboardInterrupt:
-
-        print("Userbot stopped")
-
-    except Exception as e:
-
-        print(f"Fatal error: {e}")
-        traceback.print_exc()
+    loop.run_until_complete(
+        main()
+    )
