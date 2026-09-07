@@ -13,7 +13,6 @@ from pyrogram.errors import FloodWait, RPCError
 from pyrogram.types import Message
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message as AiogramMessage,
     CallbackQuery,
@@ -58,7 +57,6 @@ db = mongo_client[MONGO_DB]
 config_col = db["config"]
 chats_col = db["chats"]
 stats_col = db["stats"]
-users_col = db["users"]
 
 
 async def mongo_init():
@@ -78,15 +76,6 @@ async def get_config(key, default=None):
 
 async def set_config(key, value):
     await config_col.update_one({"_id": key}, {"$set": {"value": value}}, upsert=True)
-
-
-async def inc_stat(key, amount=1):
-    await stats_col.update_one({"_id": key}, {"$inc": {"value": amount}}, upsert=True)
-
-
-async def get_stat(key):
-    doc = await stats_col.find_one({"_id": key})
-    return int(doc.get("value", 0)) if doc else 0
 
 
 # =========================================================
@@ -128,45 +117,19 @@ Thread(target=start_health_server, daemon=True).start()
 
 
 # =========================================================
-# HELPERS & FORCE-SUB LOGIC
+# PRIVATE CHANNEL & FORCE-SUB HELPERS
 # =========================================================
 
-def format_channel_peer(value):
-    if not value:
-        return None
-    val = str(value).strip()
-    if val.startswith("https://t.me/"):
-        val = val.replace("https://t.me/", "", 1)
-    elif val.startswith("http://t.me/"):
-        val = val.replace("http://t.me/", "", 1)
-    val = val.rstrip("/")
-
-    if val.lstrip("-").isdigit():
-        return int(val)
-    if not val.startswith("@") and not val.startswith("+"):
-        val = "@" + val
-    return val
-
-
-async def get_force_sub_channels():
-    channels = await get_config("force_sub", [])
-    if not isinstance(channels, list):
-        return []
-    return [format_channel_peer(ch) for ch in channels if ch][:3]
-
-
-async def set_force_sub_channels(channels):
-    formatted = [format_channel_peer(ch) for ch in channels if ch][:3]
-    await set_config("force_sub", formatted)
-
-
-async def check_user_membership(client_instance, channel, user_id):
+async def check_user_membership(client_instance, channel_info, user_id):
+    """
+    channel_info can be a dict {'id': -100xxx, 'link': '...'} or string/int
+    """
+    chat_id = channel_info.get("id") if isinstance(channel_info, dict) else channel_info
     try:
-        peer = format_channel_peer(channel)
         if isinstance(client_instance, Bot):
-            member = await client_instance.get_chat_member(chat_id=peer, user_id=user_id)
+            member = await client_instance.get_chat_member(chat_id=chat_id, user_id=user_id)
         else:
-            member = await client_instance.get_chat_member(peer, user_id)
+            member = await client_instance.get_chat_member(chat_id, user_id)
 
         status_str = str(getattr(member, "status", "")).lower()
         if any(s in status_str for s in ["owner", "administrator", "creator", "member"]):
@@ -175,38 +138,42 @@ async def check_user_membership(client_instance, channel, user_id):
             return bool(getattr(member, "is_member", False))
         return False
     except Exception as e:
-        log.warning(f"ForceSub check error ({channel}): {e}")
-        return None
+        log.warning(f"ForceSub check failed for channel {chat_id} (User: {user_id}): {e}")
+        return False
 
 
 async def bot_force_sub_keyboard():
-    channels = await get_force_sub_channels()
+    channels = await get_config("force_sub", [])
     buttons = []
     for index, ch in enumerate(channels, 1):
-        link = f"https://t.me/{str(ch).lstrip('@')}" if str(ch).startswith("@") else "https://t.me/"
-        buttons.append([AioInlineKeyboardButton(text=f"📢 Join Channel {index}", url=link)])
+        if isinstance(ch, dict):
+            link = ch.get("link", "https://t.me")
+            title = ch.get("title", f"Channel {index}")
+        else:
+            link = f"https://t.me/{str(ch).lstrip('@')}" if str(ch).startswith("@") else "https://t.me"
+            title = f"Channel {index}"
+
+        buttons.append([AioInlineKeyboardButton(text=f"📢 Join {title}", url=link)])
+
     buttons.append([AioInlineKeyboardButton(text="✅ Check Subscription", callback_data="check_sub")])
     return AioInlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 async def check_bot_force_sub(user_id):
-    channels = await get_force_sub_channels()
+    channels = await get_config("force_sub", [])
     if not channels:
         return True
     for ch in channels:
-        res = await check_user_membership(bot, ch, user_id)
-        if res is False:
+        joined = await check_user_membership(bot, ch, user_id)
+        if not joined:
             return False
-        if res is None:
-            return None
     return True
 
 
 # =========================================================
-# AIOGRAM BOT (GROUPS & BOT PM GUARD)
+# AIOGRAM BOT HANDLERS (GROUPS & BOT PM)
 # =========================================================
 
-# 1. GROUP GUARD: Checks every message in groups
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def group_message_guard(message: AiogramMessage):
     if not message.from_user or message.from_user.is_bot:
@@ -215,20 +182,18 @@ async def group_message_guard(message: AiogramMessage):
     user_id = message.from_user.id
     status = await check_bot_force_sub(user_id)
 
-    # Agar user channels me joined NAHI hai, toh message bhejega
+    # User channels me joined nahi hai, tabhi warning bhejega
     if status is False:
         try:
             await message.reply(
                 f"⚠️ **{message.from_user.first_name}**, aapne humare required channels join nahi kiye hain!\n\n"
-                f"Group me chat karne ke liye pehle niche diye gaye channels join karein:",
+                f"Group me message karne ke liye pehle niche diye gaye channels join karein:",
                 reply_markup=await bot_force_sub_keyboard()
             )
         except Exception as e:
             log.warning(f"Failed to send group warning: {e}")
-    # Agar JOINED hai (status == True), toh BOT SHANT RAHEGA (Nothing happens)
 
 
-# 2. BOT PM GUARD: Private messages to bot
 @dp.message(F.chat.type == ChatType.PRIVATE)
 async def bot_pm_guard(message: AiogramMessage):
     user_id = message.from_user.id
@@ -241,63 +206,128 @@ async def bot_pm_guard(message: AiogramMessage):
         )
         return
 
-    await message.answer("🚀 Bot online hai! Message received.")
+    await message.answer("🚀 Bot Active Hai!")
 
 
 @dp.callback_query(F.data == "check_sub")
 async def check_sub_callback(callback: CallbackQuery):
     status = await check_bot_force_sub(callback.from_user.id)
     if status is True:
-        await callback.message.edit_text("✅ **Subscription verified!** Ab aap chat kar sakte ho.")
-    elif status is False:
-        await callback.answer("❌ Pehle sabhi channels join karo!", show_alert=True)
+        await callback.message.edit_text("✅ **Subscription Verified!** Ab aap chat kar sakte ho.")
     else:
-        await callback.answer("⚠️ Subscription check temporarily failed.", show_alert=True)
+        await callback.answer("❌ Pehle sabhi channels join karo!", show_alert=True)
 
 
 # =========================================================
-# USERBOT PM FORCE-SUB (SESSION PM GUARD)
+# USERBOT PM GUARD (SESSION PM FORCE-SUB)
 # =========================================================
 
 @userbot.on_message(filters.private & ~filters.me & ~filters.bot)
 async def userbot_pm_forcesub(client, message: Message):
-    channels = await get_force_sub_channels()
-    if not channels:
-        return
+    try:
+        channels = await get_config("force_sub", [])
+        if not channels:
+            return
 
-    user_id = message.from_user.id
-    for ch in channels:
-        res = await check_user_membership(userbot, ch, user_id)
-        if res is False:
-            links = "\n".join([f"📢 https://t.me/{str(c).lstrip('@')}" if str(c).startswith("@") else f"📢 {c}" for c in channels])
+        user_id = message.from_user.id
+        not_joined = False
+
+        for ch in channels:
+            res = await check_user_membership(userbot, ch, user_id)
+            if not res:
+                not_joined = True
+                break
+
+        if not_joined:
+            links_text = ""
+            for index, ch in enumerate(channels, 1):
+                if isinstance(ch, dict):
+                    link = ch.get("link", "https://t.me")
+                    title = ch.get("title", f"Channel {index}")
+                else:
+                    link = f"https://t.me/{str(ch).lstrip('@')}" if str(ch).startswith("@") else "https://t.me"
+                    title = f"Channel {index}"
+                links_text += f"{index}. 📢 [{title}]({link})\n"
+
             await message.reply_text(
                 f"🔒 **Force Subscription Required**\n\n"
-                f"Mujhe PM me message karne ke liye pehle yeh channels join karo:\n\n{links}"
+                f"Mujhe PM me message karne ke liye pehle niche diye gaye channels join karo:\n\n{links_text}",
+                disable_web_page_preview=True
             )
-            return
+    except Exception as e:
+        log.error(f"Error in userbot PM forcesub: {e}")
 
 
 # =========================================================
 # USERBOT MANAGEMENT COMMANDS (SESSION CONTROL)
 # =========================================================
 
-async def resolve_target(value):
-    peer = format_channel_peer(value)
-    if isinstance(peer, int):
-        return await userbot.get_chat(peer)
-    if str(peer).startswith("+"):
-        return await userbot.join_chat(peer)
-    return await userbot.get_chat(peer)
+@userbot.on_message(filters.me & filters.command("forcesub", prefixes="."))
+async def forcesub_handler(client, message: Message):
+    args = message.command[1:]
+    if not args:
+        await message.edit_text("❌ Example:\n`.forcesub -1001947833353`\n`.forcesub https://t.me/+AbCdEfGh`\n`.forcesub @channelname`")
+        return
+
+    await message.edit_text("⏳ Processing channels & invite links...")
+    saved_channels = []
+
+    for item in args[:3]:
+        try:
+            # Agar pure URL/Invite Link diya hai
+            if item.startswith("http"):
+                chat = await userbot.get_chat(item)
+                link = item
+            else:
+                target = int(item) if item.lstrip("-").isdigit() else item
+                chat = await userbot.get_chat(target)
+                if chat.username:
+                    link = f"https://t.me/{chat.username}"
+                elif chat.invite_link:
+                    link = chat.invite_link
+                else:
+                    try:
+                        link = await userbot.export_chat_invite_link(chat.id)
+                    except Exception:
+                        link = "https://t.me"
+
+            saved_channels.append({
+                "id": chat.id,
+                "link": link,
+                "title": chat.title or str(chat.id)
+            })
+        except Exception as e:
+            log.error(f"Failed to add forcesub target ({item}): {e}")
+
+    if not saved_channels:
+        await message.edit_text("❌ Channel add nahi ho paya. Make sure userbot channel me add hai!")
+        return
+
+    await set_config("force_sub", saved_channels)
+
+    txt = "🔒 **Force-Sub Channels Set:**\n\n"
+    for i, ch in enumerate(saved_channels, 1):
+        txt += f"{i}. [{ch['title']}]({ch['link']}) (`{ch['id']}`)\n"
+
+    await message.edit_text(txt, disable_web_page_preview=True)
+
+
+@userbot.on_message(filters.me & filters.command("forcesuboff", prefixes="."))
+async def forcesuboff_handler(client, message: Message):
+    await set_config("force_sub", [])
+    await message.edit_text("🔓 **Force-Sub disabled.**")
 
 
 @userbot.on_message(filters.me & filters.command("addchat", prefixes="."))
 async def addchat_handler(client, message: Message):
     args = message.command
     try:
-        chat = message.chat if len(args) == 1 else await resolve_target(args[1])
+        target = message.chat.id if len(args) == 1 else args[1]
+        target = int(target) if str(target).lstrip("-").isdigit() else target
+        chat = await userbot.get_chat(target)
         await chats_col.update_one(
             {"_id": str(chat.id)},
-            {"$set": {"chat_id": str(chat.id), "title": chat.title or "Unknown", "updated_at": datetime.now(timezone.utc)}},
+            {"$set": {"chat_id": str(chat.id), "title": chat.title or "Unknown"}},
             upsert=True
         )
         await message.edit_text(f"✅ **Chat Added:** `{chat.title or chat.id}`")
@@ -309,8 +339,10 @@ async def addchat_handler(client, message: Message):
 async def delchat_handler(client, message: Message):
     args = message.command
     try:
-        chat_id = message.chat.id if len(args) == 1 else (await resolve_target(args[1])).id
-        res = await chats_col.delete_one({"_id": str(chat_id)})
+        target = message.chat.id if len(args) == 1 else args[1]
+        target = int(target) if str(target).lstrip("-").isdigit() else target
+        chat = await userbot.get_chat(target)
+        res = await chats_col.delete_one({"_id": str(chat.id)})
         await message.edit_text("🗑 **Removed**" if res.deleted_count else "ℹ️ Chat not found.")
     except Exception as e:
         await message.edit_text(f"❌ `{e}`")
@@ -329,43 +361,10 @@ async def listchats_handler(client, message: Message):
 @userbot.on_message(filters.me & filters.command("setmsg", prefixes="."))
 async def setmsg_handler(client, message: Message):
     if len(message.command) < 2:
-        await message.edit_text("❌ `.setmsg Hello text`")
+        await message.edit_text("❌ Example: `.setmsg Hello text`")
         return
     await set_config("msg", message.text.split(maxsplit=1)[1])
     await message.edit_text("✅ **Auto-Message updated.**")
-
-
-@userbot.on_message(filters.me & filters.command("setdelay", prefixes="."))
-async def setdelay_handler(client, message: Message):
-    if len(message.command) < 2 or not message.command[1].isdigit():
-        return
-    await set_config("delay", max(1, int(message.command[1])))
-    await message.edit_text(f"✅ Delay set to `{message.command[1]}s`")
-
-
-@userbot.on_message(filters.me & filters.command("setcycle", prefixes="."))
-async def setcycle_handler(client, message: Message):
-    if len(message.command) < 2 or not message.command[1].isdigit():
-        return
-    await set_config("cycle_delay", max(1, int(message.command[1])))
-    await message.edit_text(f"✅ Cycle set to `{message.command[1]} min`")
-
-
-@userbot.on_message(filters.me & filters.command("forcesub", prefixes="."))
-async def forcesub_handler(client, message: Message):
-    args = message.command
-    if len(args) < 2:
-        await message.edit_text("❌ Example: `.forcesub @ch1 @ch2`")
-        return
-    channels = [format_channel_peer(x) for x in args[1:4]]
-    await set_force_sub_channels(channels)
-    await message.edit_text("🔒 **Force-Sub Channels Set:**\n" + "\n".join(f"{i}. `{ch}`" for i, ch in enumerate(channels, 1)))
-
-
-@userbot.on_message(filters.me & filters.command("forcesuboff", prefixes="."))
-async def forcesuboff_handler(client, message: Message):
-    await set_force_sub_channels([])
-    await message.edit_text("🔓 **Force-Sub disabled.**")
 
 
 @userbot.on_message(filters.me & filters.command("automsg", prefixes="."))
@@ -382,8 +381,8 @@ async def userbot_help(client, message: Message):
     await message.edit_text(
         "🤖 **Session Commands**\n\n"
         "`.addchat` | `.delchat` | `.listchats`\n"
-        "`.setmsg text` | `.setdelay 10` | `.setcycle 15`\n"
-        "`.forcesub @ch1 @ch2` | `.forcesuboff`\n"
+        "`.setmsg text`\n"
+        "`.forcesub -100123456789` | `.forcesuboff`\n"
         "`.automsg on/off`"
     )
 
@@ -391,21 +390,6 @@ async def userbot_help(client, message: Message):
 # =========================================================
 # BROADCAST WORKER
 # =========================================================
-
-async def safe_send(chat_id, text):
-    try:
-        await userbot.send_message(chat_id, text)
-        return True
-    except FloodWait as e:
-        await asyncio.sleep(int(e.value))
-        try:
-            await userbot.send_message(chat_id, text)
-            return True
-        except Exception:
-            return False
-    except Exception:
-        return False
-
 
 async def broadcast_worker():
     while True:
@@ -423,8 +407,12 @@ async def broadcast_worker():
                 for chat in chats:
                     if await get_config("status", "OFF") != "ON":
                         break
-                    await safe_send(format_channel_peer(chat.get("chat_id")), msg_text)
-                    await asyncio.sleep(random.randint(max(3, delay - 2), delay + 4))
+                    try:
+                        c_id = int(chat.get("chat_id")) if chat.get("chat_id").lstrip("-").isdigit() else chat.get("chat_id")
+                        await userbot.send_message(c_id, msg_text)
+                    except Exception as e:
+                        log.warning(f"Broadcast send failed for {chat.get('chat_id')}: {e}")
+                    await asyncio.sleep(delay)
 
                 if await get_config("status", "OFF") == "ON":
                     await asyncio.sleep(cycle * 60)
