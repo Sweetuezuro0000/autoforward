@@ -1,252 +1,370 @@
 import asyncio
-import os
-import logging
-from threading import Thread
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from motor.motor_asyncio import AsyncIOMotorClient
+# Python 3.10+ / 3.14 asyncio event loop fix
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+import os
+import sqlite3
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pyrogram import Client, filters
+from pyrogram.enums import ChatMemberStatus
+from pyrogram.errors import FloodWait
 from pyrogram.types import Message
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import (
-    Message as AiogramMessage,
-    CallbackQuery,
-    InlineKeyboardMarkup as AioInlineKeyboardMarkup,
-    InlineKeyboardButton as AioInlineKeyboardButton,
-)
-from aiogram.enums import ChatType
-
-# ================= LOGGING & ENV =================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("autoforward")
-
-API_ID = int(os.environ.get("API_ID", "0"))
+# Credentials
+API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 SESSION_STRING = os.environ.get("SESSION_STRING", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-MONGO_URI = os.environ.get("MONGO_URI", "")
-MONGO_DB = os.environ.get("MONGO_DB", "autoforward")
-FORCE_SUB_ENV = os.environ.get("FORCE_SUB", "")
-PORT = int(os.environ.get("PORT", "10000"))
 
-# ================= MONGODB SETUP =================
-mongo_client = AsyncIOMotorClient(MONGO_URI)
-db = mongo_client[MONGO_DB]
-config_col = db["config"]
-chats_col = db["chats"]
+app = Client(
+    "userbot_session",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    session_string=SESSION_STRING,
+)
 
-async def mongo_init():
-    await config_col.update_one({"_id": "status"}, {"$setOnInsert": {"value": "OFF"}}, upsert=True)
-    await config_col.update_one({"_id": "delay"}, {"$setOnInsert": {"value": 8}}, upsert=True)
-    await config_col.update_one({"_id": "msg"}, {"$setOnInsert": {"value": "Default Message"}}, upsert=True)
-    await config_col.update_one({"_id": "force_sub"}, {"$setOnInsert": {"value": []}}, upsert=True)
 
-async def get_config(key, default=None):
-    doc = await config_col.find_one({"_id": key})
-    return doc.get("value", default) if doc else default
+# ================= DUMMY WEB SERVER (FOR RENDER HEALTH CHECK) =================
+class HealthCheckHandler(BaseHTTPRequestHandler):
 
-async def set_config(key, value):
-    await config_col.update_one({"_id": key}, {"$set": {"value": value}}, upsert=True)
-
-# ================= HELPERS =================
-def parse_id(val):
-    s = str(val).strip()
-    if s.startswith("100") and len(s) >= 12:
-        s = "-" + s
-    return int(s) if s.lstrip("-").isdigit() else s
-
-userbot = Client("userbot_session", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-
-# ================= HEALTH SERVER =================
-class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"OK")
-    def log_message(self, *args): pass
+        self.wfile.write(b"Userbot is running perfectly!")
 
-Thread(target=lambda: ThreadingHTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever(), daemon=True).start()
+    def log_message(self, format, *args):
+        return
 
-# ================= FORCE-SUB ENGINE =================
-async def is_subscribed(client_inst, chat_id, user_id):
-    try:
-        c_id = parse_id(chat_id)
-        if isinstance(client_inst, Bot):
-            m = await client_inst.get_chat_member(c_id, user_id)
-        else:
-            m = await client_inst.get_chat_member(c_id, user_id)
-        return str(m.status).lower() in ["owner", "administrator", "creator", "member"]
-    except Exception as e:
-        log.error(f"Check sub error [{chat_id}]: {e}")
+
+def start_dummy_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
+
+threading.Thread(target=start_dummy_server, daemon=True).start()
+
+# ================= DATABASE SETUP =================
+conn = sqlite3.connect("userbot_data.db", check_same_thread=False)
+cursor = conn.cursor()
+
+cursor.execute(
+    "CREATE TABLE IF NOT EXISTS chats (chat_id TEXT PRIMARY KEY, title TEXT, interval_sec INTEGER DEFAULT 60, last_sent REAL DEFAULT 0)"
+)
+cursor.execute(
+    "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)"
+)
+cursor.execute(
+    "CREATE TABLE IF NOT EXISTS stats (key TEXT PRIMARY KEY, value INTEGER)"
+)
+
+# Migration support for existing DB
+try:
+    cursor.execute(
+        "ALTER TABLE chats ADD COLUMN interval_sec INTEGER DEFAULT 60"
+    )
+except Exception:
+    pass
+try:
+    cursor.execute("ALTER TABLE chats ADD COLUMN last_sent REAL DEFAULT 0")
+except Exception:
+    pass
+
+conn.commit()
+
+
+def get_config(key, default=""):
+    cursor.execute("SELECT value FROM config WHERE key=?", (key,))
+    res = cursor.fetchone()
+    return res[0] if res else default
+
+
+def set_config(key, value):
+    cursor.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+        (key, str(value)),
+    )
+    conn.commit()
+
+
+def get_stat(key):
+    cursor.execute("SELECT value FROM stats WHERE key=?", (key,))
+    res = cursor.fetchone()
+    return res[0] if res else 0
+
+
+def inc_stat(key, amount=1):
+    current = get_stat(key)
+    cursor.execute(
+        "INSERT OR REPLACE INTO stats (key, value) VALUES (?, ?)",
+        (key, current + amount),
+    )
+    conn.commit()
+
+
+def get_all_chats():
+    cursor.execute("SELECT chat_id, title, interval_sec, last_sent FROM chats")
+    return cursor.fetchall()
+
+
+def update_last_sent(chat_id, timestamp):
+    cursor.execute(
+        "UPDATE chats SET last_sent=? WHERE chat_id=?", (timestamp, chat_id)
+    )
+    conn.commit()
+
+
+# Defaults
+if not get_config("status"):
+    set_config("status", "OFF")
+if not get_config("msg"):
+    set_config("msg", "Default Auto Message")
+if not get_config("force_sub"):
+    set_config("force_sub", "")
+
+
+# ================= FORCE SUB CHECK =================
+async def is_force_sub_active():
+    channel = get_config("force_sub")
+    if not channel:
         return True
+    try:
+        if "t.me/" in channel:
+            channel = channel.split("t.me/")[1].replace("/", "")
+        channel = channel.replace("@", "").strip()
 
-async def get_bot_keyboard():
-    channels = await get_config("force_sub", [])
-    btns = []
-    for i, ch in enumerate(channels, 1):
-        link = ch.get("link", "https://t.me") if isinstance(ch, dict) else "https://t.me"
-        title = ch.get("title", f"Channel {i}") if isinstance(ch, dict) else f"Channel {i}"
-        btns.append([AioInlineKeyboardButton(text=f"📢 Join {title}", url=link)])
-    btns.append([AioInlineKeyboardButton(text="✅ Check Subscription", callback_data="check_sub")])
-    return AioInlineKeyboardMarkup(inline_keyboard=btns)
+        me = await app.get_me()
+        member = await app.get_chat_member(channel, me.id)
 
-# 1. BOT PM FORCE-SUB
-@dp.message(F.chat.type == ChatType.PRIVATE)
-async def bot_pm_guard(msg: AiogramMessage):
-    channels = await get_config("force_sub", [])
-    for ch in channels:
-        ch_id = ch.get("id") if isinstance(ch, dict) else ch
-        if not await is_subscribed(bot, ch_id, msg.from_user.id):
-            await msg.answer("🔒 **Pehle niche diye gaye channels join karo:**", reply_markup=await get_bot_keyboard())
-            return
-    await msg.answer("🚀 Bot Active Hai!")
+        if member.status in [
+            ChatMemberStatus.OWNER,
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.MEMBER,
+        ]:
+            return True
+    except Exception as e:
+        print(f"[ForceSub Error] {e}")
+        return False
+    return False
 
-@dp.callback_query(F.data == "check_sub")
-async def check_sub_cb(cb: CallbackQuery):
-    channels = await get_config("force_sub", [])
-    for ch in channels:
-        ch_id = ch.get("id") if isinstance(ch, dict) else ch
-        if not await is_subscribed(bot, ch_id, cb.from_user.id):
-            await cb.answer("❌ Pehle sabhi channels join karo!", show_alert=True)
-            return
-    await cb.message.edit_text("✅ **Subscription Verified!**")
 
-# 2. SESSION USERBOT PM FORCE-SUB
-@userbot.on_message(filters.private & ~filters.me & ~filters.bot)
-async def userbot_pm_guard(cli, msg: Message):
-    channels = await get_config("force_sub", [])
-    if not channels:
-        return
-    
-    for ch in channels:
-        ch_id = ch.get("id") if isinstance(ch, dict) else ch
-        if not await is_subscribed(userbot, ch_id, msg.from_user.id):
-            txt = "🔒 **Mujhe PM me message karne ke liye pehle channels join karo:**\n\n"
-            for i, c in enumerate(channels, 1):
-                link = c.get("link", "https://t.me") if isinstance(c, dict) else "https://t.me"
-                title = c.get("title", f"Channel {i}") if isinstance(c, dict) else f"Channel {i}"
-                txt += f"{i}. 📢 [{title}]({link})\n"
-            await msg.reply_text(txt, disable_web_page_preview=True)
-            return
+# ================= INDIVIDUAL CHAT TIMER BROADCASTER =================
+async def auto_broadcast_loop():
+    while True:
+        await asyncio.sleep(2)
+        if get_config("status") != "ON":
+            continue
 
-# 3. SESSION DOT COMMANDS
-@userbot.on_message(filters.outgoing)
-async def session_commands(cli, msg: Message):
-    if not msg.text or not msg.text.startswith("."):
-        return
+        if not await is_force_sub_active():
+            set_config("status", "OFF")
+            await app.send_message(
+                "me",
+                f"❌ **Auto Msg Stopped!** Force Sub Channel (@{get_config('force_sub')}) leave kar diya gaya hai.",
+            )
+            continue
 
-    parts = msg.text.strip().split()
-    cmd = parts[0].lower()
-    args = parts[1:]
+        chats = get_all_chats()
+        msg_text = get_config("msg")
 
-    if cmd == ".help":
-        await msg.edit_text(
-            "🤖 **Session Commands Active:**\n\n"
-            "• `.forcesub -100xxx -100yyy` : Set Channels\n"
-            "• `.forcesuboff` : Clear ForceSub\n"
-            "• `.addchat` : Add current chat to broadcast\n"
-            "• `.delchat` : Remove current chat\n"
-            "• `.listchats` : View target chats\n"
-            "• `.setmsg text` : Set broadcast message\n"
-            "• `.automsg on/off` : Toggle Auto Broadcast"
+        if not chats or not msg_text:
+            continue
+
+        current_time = time.time()
+
+        for chat_id, title, interval_sec, last_sent in chats:
+            if get_config("status") != "ON":
+                break
+
+            # Check if this chat's specific interval time has passed
+            if current_time - last_sent >= interval_sec:
+                try:
+                    target = (
+                        int(chat_id)
+                        if chat_id.lstrip("-").isdigit()
+                        else chat_id
+                    )
+                    await app.send_message(target, msg_text)
+
+                    update_last_sent(chat_id, time.time())
+                    inc_stat("total_sent")
+                    inc_stat("success_sent")
+
+                    # Flood preventer gap between sending to multiple chats in same tick
+                    await asyncio.sleep(2)
+
+                except FloodWait as e:
+                    print(f"FloodWait hit: Sleeping for {e.value}s")
+                    await asyncio.sleep(e.value)
+                except Exception as e:
+                    inc_stat("failed_sent")
+                    print(f"[Send Error] {chat_id}: {e}")
+
+
+# ================= COMMAND HANDLERS =================
+
+
+@app.on_message(filters.me & filters.command("addchat", prefixes="."))
+async def add_chat_handler(client, message: Message):
+    """
+    Usage:
+    .addchat (current chat me 60s delay)
+    .addchat 30 (current chat me 30s delay)
+    .addchat @groupname 45 (target group me 45s delay)
+    """
+    args = message.text.split()
+    interval = 60  # Default 60 seconds
+
+    if len(args) == 1:
+        target = message.chat.id
+    elif len(args) == 2:
+        if args[1].isdigit():
+            target = message.chat.id
+            interval = int(args[1])
+        else:
+            target = args[1]
+    else:
+        target = args[1]
+        if args[2].isdigit():
+            interval = int(args[2])
+
+    if isinstance(target, str):
+        if "t.me/" in target:
+            target = target.split("t.me/")[1].replace("/", "").replace("+", "")
+        if target.lstrip("-").isdigit():
+            target = int(target)
+        elif not target.startswith("@"):
+            target = f"@{target}"
+
+    try:
+        chat_obj = await client.get_chat(target)
+        chat_id = str(chat_obj.id)
+        title = chat_obj.title or chat_obj.first_name or "Unknown"
+
+        cursor.execute(
+            "INSERT OR REPLACE INTO chats (chat_id, title, interval_sec, last_sent) VALUES (?, ?, ?, ?)",
+            (chat_id, title, interval, 0),
+        )
+        conn.commit()
+
+        await message.edit_text(
+            f"✅ **Chat Added!**\n\n"
+            f"📌 **Title:** `{title}`\n"
+            f"🆔 **ID:** `{chat_id}`\n"
+            f"⏱ **Interval:** Har `{interval}` seconds"
+        )
+    except Exception as e:
+        await message.edit_text(f"❌ **Error adding chat:** `{e}`")
+
+
+@app.on_message(filters.me & filters.command("setchatdelay", prefixes="."))
+async def set_chat_delay_handler(client, message: Message):
+    """Usage: .setchatdelay -100123456789 30"""
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3 or not args[2].isdigit():
+        return await message.edit_text(
+            "❌ **Usage:** `.setchatdelay <chat_id> <seconds>`"
         )
 
-    elif cmd == ".forcesub":
-        if not args:
-            await msg.edit_text("❌ Example: `.forcesub -10012345678 -10098765432`")
-            return
-        await msg.edit_text("⏳ Saving channels...")
-        saved = []
-        clean_args = " ".join(args).replace(",", " ").split()
-        for item in clean_args[:3]:
-            try:
-                chat = await userbot.get_chat(parse_id(item))
-                link = chat.username and f"https://t.me/{chat.username}" or chat.invite_link or "https://t.me"
-                saved.append({"id": chat.id, "link": link, "title": chat.title or str(chat.id)})
-            except Exception as e:
-                log.error(f"Forcesub add error: {e}")
-        
-        await set_config("force_sub", saved)
-        await msg.edit_text(f"✅ **ForceSub Set:** Saved {len(saved)} channel(s).")
+    chat_id = args[1].strip()
+    interval = int(args[2])
 
-    elif cmd == ".forcesuboff":
-        await set_config("force_sub", [])
-        await msg.edit_text("🔓 **Force-Sub Disabled.**")
+    cursor.execute(
+        "UPDATE chats SET interval_sec=? WHERE chat_id=?", (interval, chat_id)
+    )
+    conn.commit()
+    await message.edit_text(
+        f"⏱ **Chat `{chat_id}` ka delay `{interval}` seconds set kar diya gaya hai!**"
+    )
 
-    elif cmd == ".addchat":
-        target = parse_id(args[0]) if args else msg.chat.id
-        chat = await userbot.get_chat(target)
-        await chats_col.update_one({"_id": str(chat.id)}, {"$set": {"chat_id": str(chat.id), "title": chat.title or "Chat"}}, upsert=True)
-        await msg.edit_text(f"✅ **Chat Added:** `{chat.title or chat.id}`")
 
-    elif cmd == ".delchat":
-        target = parse_id(args[0]) if args else msg.chat.id
-        await chats_col.delete_one({"_id": str(target)})
-        await msg.edit_text("🗑 **Chat Removed.**")
+@app.on_message(filters.me & filters.command("delchat", prefixes="."))
+async def del_chat_handler(client, message: Message):
+    args = message.text.split(maxsplit=1)
+    chat_id = str(message.chat.id) if len(args) < 2 else args[1].strip()
+    cursor.execute("DELETE FROM chats WHERE chat_id=?", (chat_id,))
+    conn.commit()
+    await message.edit_text(f"🗑 **Chat `{chat_id}` Removed!**")
 
-    elif cmd == ".listchats":
-        chats = await chats_col.find().to_list(1000)
-        txt = "📋 **Target Chats:**\n\n" + "\n".join(f"{i}. {c.get('title')} (`{c.get('chat_id')}`)" for i, c in enumerate(chats, 1))
-        await msg.edit_text(txt if chats else "ℹ️ No chats added.")
 
-    elif cmd == ".setmsg":
-        if not args:
-            return await msg.edit_text("❌ Text missing.")
-        new_text = msg.text.split(maxsplit=1)[1]
-        await set_config("msg", new_text)
-        await msg.edit_text(f"✅ **Message Saved:**\n\n{new_text}")
+@app.on_message(filters.me & filters.command("listchats", prefixes="."))
+async def list_chats_handler(client, message: Message):
+    chats = get_all_chats()
+    if not chats:
+        return await message.edit_text("ℹ️ No chats added.")
 
-    elif cmd == ".automsg":
-        if not args or args[0].lower() not in ["on", "off"]:
-            return await msg.edit_text("❌ Usage: `.automsg on` or `.automsg off`")
-        st = args[0].upper()
-        await set_config("status", st)
-        await msg.edit_text(f"🤖 **Auto Broadcast:** `{st}`")
+    text = "📋 **Target Chats & Custom Timing:**\n\n"
+    for idx, (c_id, title, interval, _) in enumerate(chats, 1):
+        text += f"{idx}. **{title}** | `{c_id}`\n   ⏱ **Interval:** `{interval}s`\n"
 
-# ================= BROADCAST WORKER =================
-async def broadcast_worker():
-    while True:
-        try:
-            await asyncio.sleep(2)
-            if await get_config("status", "OFF") != "ON":
-                continue
-            msg_text = await get_config("msg", "")
-            delay = int(await get_config("delay", 8))
-            chats = await chats_col.find().to_list(1000)
-            if msg_text and chats:
-                for c in chats:
-                    if await get_config("status", "OFF") != "ON": break
-                    try:
-                        await userbot.send_message(parse_id(c.get("chat_id")), msg_text)
-                    except Exception: pass
-                    await asyncio.sleep(delay)
-        except Exception:
-            await asyncio.sleep(5)
+    await message.edit_text(text)
 
-# ================= MAIN =================
+
+@app.on_message(filters.me & filters.command("setmsg", prefixes="."))
+async def set_msg_handler(client, message: Message):
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        return await message.edit_text("❌ `.setmsg <text>`")
+    set_config("msg", args[1])
+    await message.edit_text(f"✅ **Message Updated!**")
+
+
+@app.on_message(filters.me & filters.command("forcesub", prefixes="."))
+async def set_forcesub_handler(client, message: Message):
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        return await message.edit_text("❌ `.forcesub <channel_username>`")
+    ch = args[1].replace("@", "").replace("t.me/", "").strip()
+    set_config("force_sub", ch)
+    await message.edit_text(f"🔒 **Force Sub set to:** `@{ch}`")
+
+
+@app.on_message(filters.me & filters.command("automsg", prefixes="."))
+async def toggle_automsg(client, message: Message):
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2 or args[1].lower() not in ["on", "off"]:
+        return await message.edit_text("❌ `.automsg on` ya `.automsg off`")
+    state = args[1].upper()
+
+    if state == "ON" and not await is_force_sub_active():
+        return await message.edit_text(
+            f"❌ Join @{get_config('force_sub')} first!"
+        )
+
+    set_config("status", state)
+    await message.edit_text(f"🤖 **Auto Messaging is `{state}`!**")
+
+
+@app.on_message(filters.me & filters.command("stats", prefixes="."))
+async def stats_handler(client, message: Message):
+    chats = get_all_chats()
+    stats_text = (
+        "📊 **Auto-Bot Per-Chat Dashboard**\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚡ **Status:** `{get_config('status')}`\n"
+        f"🔒 **Force Sub:** `@{get_config('force_sub') or 'None'}`\n"
+        f"🎯 **Target Chats:** `{len(chats)} Groups`\n\n"
+        "📈 **Sending History:**\n"
+        f"├ 🚀 **Total Attempts:** `{get_stat('total_sent')}`\n"
+        f"├ ✅ **Successfully Sent:** `{get_stat('success_sent')}`\n"
+        f"└ ❌ **Failed:** `{get_stat('failed_sent')}`\n\n"
+        f"📝 **Current Active Message:**\n`{get_config('msg')}`"
+    )
+    await message.edit_text(stats_text)
+
+
+# ================= RUNNER =================
 async def main():
-    await mongo_init()
-    await userbot.start()
-    
-    # Auto load FORCE_SUB from Render ENV on restart
-    if FORCE_SUB_ENV:
-        raws = [x.strip() for x in FORCE_SUB_ENV.replace(" ", "").split(",") if x.strip()]
-        saved = []
-        for r in raws[:3]:
-            try:
-                ch = await userbot.get_chat(parse_id(r))
-                lk = ch.username and f"https://t.me/{ch.username}" or ch.invite_link or "https://t.me"
-                saved.append({"id": ch.id, "link": lk, "title": ch.title or str(ch.id)})
-            except Exception: pass
-        if saved:
-            await set_config("force_sub", saved)
+    await app.start()
+    print("Userbot started with Per-Chat Timers!")
+    asyncio.create_task(auto_broadcast_loop())
+    await asyncio.Event().wait()
 
-    await bot.delete_webhook(drop_pending_updates=True)
-    asyncio.create_task(broadcast_worker())
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
