@@ -1,6 +1,6 @@
 import logging
-from pyrogram import Client, filters
-from pyrogram.types import Message
+from hydrogram import Client, filters
+from hydrogram.types import Message
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from force import ForceSubManager
 
