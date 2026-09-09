@@ -1,588 +1,241 @@
-import asyncio
-import time
-
-from pyrogram import filters
-from pyrogram.errors import FloodWait
+import logging
+from pyrogram import Client, filters
 from pyrogram.types import Message
+from motor.motor_asyncio import AsyncIOMotorDatabase
+from force import ForceSubManager
 
-from aiogram.filters import Command, CommandStart
+logger = logging.getLogger(__name__)
 
-from main import (
-    app,
-    dp,
-    get_config,
-    set_config,
-    chats_col,
-    log,
-)
+def register_handlers(userbot: Client, bot: Client, db: AsyncIOMotorDatabase, fs_mgr: ForceSubManager):
+    config_col = db["config"]
+    chats_col = db["chats"]
 
-import force
+    # ================= USERBOT COMMANDS (filters.outgoing) =================
 
-# =========================================================
-# CHAT HELPERS
-# =========================================================
-
-async def get_chats():
-    return await chats_col.find().to_list(1000)
-
-
-# =========================================================
-# .help
-# =========================================================
-
-@app.on_message(
-    filters.outgoing &
-    filters.command("help", prefixes=".")
-)
-async def help_command(
-    client,
-    message: Message
-):
-    await message.edit_text(
-        "🤖 **Session Commands**\n\n"
-        "`.help`\n"
-        "`.forcesub -100xxx -100yyy`\n"
-        "`.forcesuboff`\n"
-        "`.addchat`\n"
-        "`.addchat 30`\n"
-        "`.addchat @group 60`\n"
-        "`.delchat`\n"
-        "`.delchat -100xxx`\n"
-        "`.listchats`\n"
-        "`.setchatdelay -100xxx 30`\n"
-        "`.setmsg text`\n"
-        "`.automsg on`\n"
-        "`.automsg off`\n"
-        "`.status`"
-    )
-
-
-# =========================================================
-# .addchat
-# =========================================================
-
-@app.on_message(
-    filters.outgoing &
-    filters.command("addchat", prefixes=".")
-)
-async def addchat_command(
-    client,
-    message: Message
-):
-    args = (message.text or "").split()
-
-    interval = 60
-
-    if len(args) == 1:
-
-        target = message.chat.id
-
-    elif len(args) == 2:
-
-        if args[1].isdigit():
-            target = message.chat.id
-            interval = int(args[1])
-
-        else:
-            target = force.normalize_target(
-                args[1]
-            )
-
-    else:
-
-        target = force.normalize_target(
-            args[1]
+    @userbot.on_message(filters.outgoing & filters.command("help", prefixes="."))
+    async def cmd_userbot_help(client: Client, message: Message):
+        text = (
+            "🤖 **Userbot Command Panel**\n\n"
+            "• `.help` - Show this menu\n"
+            "• `.forcesub <channel_id/username>` - Set ForceSub channel\n"
+            "• `.forcesuboff` - Disable ForceSub\n"
+            "• `.addchat <chat_id> [delay]` - Add chat to auto broadcast\n"
+            "• `.delchat <chat_id>` - Remove chat from auto broadcast\n"
+            "• `.listchats` - List all broadcast chats\n"
+            "• `.setchatdelay <chat_id> <seconds>` - Update per-chat delay\n"
+            "• `.setmsg <message>` - Set auto broadcast message\n"
+            "• `.automsg <on/off>` - Enable or Disable auto broadcast\n"
+            "• `.status` - View current configuration & status"
         )
+        await message.edit_text(text)
 
-        if args[2].isdigit():
-            interval = int(args[2])
-
-    try:
-
-        chat = await client.get_chat(target)
-
-        title = (
-            chat.title
-            or chat.first_name
-            or "Unknown"
-        )
-
-        await chats_col.update_one(
-            {"_id": str(chat.id)},
-            {
-                "$set": {
-                    "chat_id": str(chat.id),
-                    "title": title,
-                    "interval_sec": interval,
-                    "last_sent": 0,
-                }
-            },
-            upsert=True
-        )
-
-        await message.edit_text(
-            "✅ **Chat Added!**\n\n"
-            f"📌 **Title:** `{title}`\n"
-            f"🆔 **ID:** `{chat.id}`\n"
-            f"⏱ **Interval:** `{interval}` seconds"
-        )
-
-    except Exception as e:
-
-        await message.edit_text(
-            f"❌ **Error adding chat:**\n`{e}`"
-        )
-
-
-# =========================================================
-# .delchat
-# =========================================================
-
-@app.on_message(
-    filters.outgoing &
-    filters.command("delchat", prefixes=".")
-)
-async def delchat_command(
-    client,
-    message: Message
-):
-    args = (message.text or "").split(
-        maxsplit=1
-    )
-
-    if len(args) < 2:
-        chat_id = str(message.chat.id)
-    else:
-        chat_id = args[1].strip()
-
-    result = await chats_col.delete_one(
-        {"_id": chat_id}
-    )
-
-    if result.deleted_count:
-        await message.edit_text(
-            f"🗑 **Chat Removed:** `{chat_id}`"
-        )
-    else:
-        await message.edit_text(
-            f"ℹ️ Chat `{chat_id}` not found."
-        )
-
-
-# =========================================================
-# .listchats
-# =========================================================
-
-@app.on_message(
-    filters.outgoing &
-    filters.command("listchats", prefixes=".")
-)
-async def listchats_command(
-    client,
-    message: Message
-):
-    chats = await get_chats()
-
-    if not chats:
-        return await message.edit_text(
-            "ℹ️ **No chats added.**"
-        )
-
-    text = "📋 **Target Chats**\n\n"
-
-    for i, chat in enumerate(
-        chats,
-        1
-    ):
-
-        text += (
-            f"{i}. **{chat.get('title', 'Chat')}**\n"
-            f"🆔 `{chat.get('chat_id')}`\n"
-            f"⏱ `{chat.get('interval_sec', 60)}s`\n\n"
-        )
-
-    await message.edit_text(text)
-
-
-# =========================================================
-# .setchatdelay
-# =========================================================
-
-@app.on_message(
-    filters.outgoing &
-    filters.command("setchatdelay", prefixes=".")
-)
-async def setchatdelay_command(
-    client,
-    message: Message
-):
-    args = (message.text or "").split(
-        maxsplit=2
-    )
-
-    if (
-        len(args) < 3
-        or not args[2].isdigit()
-    ):
-        return await message.edit_text(
-            "❌ **Usage:**\n"
-            "`.setchatdelay <chat_id> <seconds>`"
-        )
-
-    chat_id = args[1].strip()
-    seconds = int(args[2])
-
-    result = await chats_col.update_one(
-        {"_id": chat_id},
-        {
-            "$set": {
-                "interval_sec": seconds
-            }
-        }
-    )
-
-    if result.matched_count == 0:
-        return await message.edit_text(
-            "❌ **Chat not found.**"
-        )
-
-    await message.edit_text(
-        f"✅ **Delay Updated**\n\n"
-        f"🆔 `{chat_id}`\n"
-        f"⏱ `{seconds}` seconds"
-    )
-
-
-# =========================================================
-# .setmsg
-# =========================================================
-
-@app.on_message(
-    filters.outgoing &
-    filters.command("setmsg", prefixes=".")
-)
-async def setmsg_command(
-    client,
-    message: Message
-):
-    args = (message.text or "").split(
-        maxsplit=1
-    )
-
-    if len(args) < 2:
-        return await message.edit_text(
-            "❌ **Usage:** `.setmsg <text>`"
-        )
-
-    await set_config(
-        "msg",
-        args[1]
-    )
-
-    await message.edit_text(
-        "✅ **Message Saved.**"
-    )
-
-
-# =========================================================
-# .automsg
-# =========================================================
-
-@app.on_message(
-    filters.outgoing &
-    filters.command("automsg", prefixes=".")
-)
-async def automsg_command(
-    client,
-    message: Message
-):
-    args = (message.text or "").split(
-        maxsplit=1
-    )
-
-    if (
-        len(args) < 2
-        or args[1].lower() not in {
-            "on",
-            "off"
-        }
-    ):
-        return await message.edit_text(
-            "❌ **Usage:**\n"
-            "`.automsg on`\n"
-            "`.automsg off`"
-        )
-
-    state = args[1].upper()
-
-    if state == "ON":
-
-        channels = await force.get_force_channels()
-
-        if channels:
-
-            me = await client.get_me()
-
-            for channel in channels:
-
-                chat_id = (
-                    channel.get("id")
-                    if isinstance(channel, dict)
-                    else channel
-                )
-
-                ok = await force.is_subscribed(
-                    client,
-                    chat_id,
-                    me.id
-                )
-
-                if not ok:
-                    return await message.edit_text(
-                        "❌ **ForceSub check failed.**\n"
-                        "Pehle required channel(s) join karo."
-                    )
-
-    await set_config(
-        "status",
-        state
-    )
-
-    await message.edit_text(
-        f"🤖 **Auto Messaging `{state}`!**"
-    )
-
-
-# =========================================================
-# .status
-# =========================================================
-
-@app.on_message(
-    filters.outgoing &
-    filters.command("status", prefixes=".")
-)
-async def status_command(
-    client,
-    message: Message
-):
-    chats = await get_chats()
-    channels = await force.get_force_channels()
-
-    await message.edit_text(
-        "📊 **Status**\n\n"
-        f"⚡ **Auto:** `{await get_config('status', 'OFF')}`\n"
-        f"🔒 **ForceSub:** `{len(channels)} channel(s)`\n"
-        f"🎯 **Chats:** `{len(chats)}`\n"
-        f"📝 **Message:** `{await get_config('msg', '')}`"
-    )
-
-
-# =========================================================
-# AUTO BROADCAST WORKER
-# =========================================================
-
-async def broadcast_worker():
-
-    while True:
+    @userbot.on_message(filters.outgoing & filters.command("forcesub", prefixes="."))
+    async def cmd_set_forcesub(client: Client, message: Message):
+        if len(message.command) < 2:
+            await message.edit_text("❌ **Usage:** `.forcesub <channel_id or @username>`")
+            return
+        target = message.command[1]
+        try:
+            target = int(target)
+        except ValueError:
+            pass
 
         try:
-
-            await asyncio.sleep(2)
-
-            if (
-                await get_config(
-                    "status",
-                    "OFF"
-                ) != "ON"
-            ):
-                continue
-
-            # -------------------------
-            # FORCE SUB CHECK
-            # -------------------------
-
-            channels = (
-                await force.get_force_channels()
-            )
-
-            if channels:
-
-                me = await app.get_me()
-
-                force_failed = False
-
-                for channel in channels:
-
-                    chat_id = (
-                        channel.get("id")
-                        if isinstance(channel, dict)
-                        else channel
-                    )
-
-                    if not await force.is_subscribed(
-                        app,
-                        chat_id,
-                        me.id
-                    ):
-                        force_failed = True
-                        break
-
-                if force_failed:
-
-                    await set_config(
-                        "status",
-                        "OFF"
-                    )
-
-                    try:
-                        await app.send_message(
-                            "me",
-                            "❌ **Auto Msg Stopped!**\n"
-                            "ForceSub channel membership "
-                            "check failed."
-                        )
-                    except Exception:
-                        pass
-
-                    continue
-
-            # -------------------------
-            # MESSAGE
-            # -------------------------
-
-            msg_text = await get_config(
-                "msg",
-                ""
-            )
-
-            if not msg_text:
-                continue
-
-            chats = await get_chats()
-
-            now = time.time()
-
-            # -------------------------
-            # SEND LOOP
-            # -------------------------
-
-            for chat in chats:
-
-                if (
-                    await get_config(
-                        "status",
-                        "OFF"
-                    ) != "ON"
-                ):
-                    break
-
-                chat_id = chat.get(
-                    "chat_id"
-                )
-
-                interval = int(
-                    chat.get(
-                        "interval_sec",
-                        60
-                    )
-                )
-
-                last_sent = float(
-                    chat.get(
-                        "last_sent",
-                        0
-                    ) or 0
-                )
-
-                if (
-                    now - last_sent
-                    < interval
-                ):
-                    continue
-
-                try:
-
-                    if str(chat_id).lstrip("-").isdigit():
-                        target = int(chat_id)
-                    else:
-                        target = chat_id
-
-                    await app.send_message(
-                        target,
-                        msg_text
-                    )
-
-                    await chats_col.update_one(
-                        {"_id": chat["_id"]},
-                        {
-                            "$set": {
-                                "last_sent": time.time()
-                            }
-                        }
-                    )
-
-                    await asyncio.sleep(2)
-
-                except FloodWait as e:
-
-                    log.warning(
-                        f"FloodWait: {e.value}s"
-                    )
-
-                    await asyncio.sleep(
-                        e.value
-                    )
-
-                except Exception as e:
-
-                    log.error(
-                        f"[Send Error] "
-                        f"{chat_id}: {e}"
-                    )
-
+            chat = await client.get_chat(target)
+            target_id = chat.id
         except Exception as e:
+            await message.edit_text(f"❌ **Invalid Channel/Peer ID:** `{e}`")
+            return
 
-            log.error(
-                f"[Broadcast Error] {e}"
-            )
+        await fs_mgr.set_forcesub(target_id)
+        await message.edit_text(f"✅ **ForceSub set to:** `{target_id}`")
 
-            await asyncio.sleep(5)
+    @userbot.on_message(filters.outgoing & filters.command("forcesuboff", prefixes="."))
+    async def cmd_forcesuboff(client: Client, message: Message):
+        await fs_mgr.remove_forcesub()
+        await message.edit_text("✅ **ForceSub has been disabled.**")
 
+    @userbot.on_message(filters.outgoing & filters.command("addchat", prefixes="."))
+    async def cmd_addchat(client: Client, message: Message):
+        if len(message.command) < 2:
+            await message.edit_text("❌ **Usage:** `.addchat <chat_id> [delay_in_seconds]`")
+            return
 
-# =========================================================
-# TELEGRAM BOT API COMMANDS
-# =========================================================
+        try:
+            chat_id = int(message.command[1])
+        except ValueError:
+            await message.edit_text("❌ **Chat ID must be an integer!**")
+            return
 
-if True:
+        delay = 60
+        if len(message.command) >= 3:
+            try:
+                delay = int(message.command[2])
+            except ValueError:
+                pass
 
-    @dp.message(CommandStart())
-    async def bot_start(message):
-        await message.answer(
-            "🚀 **Bot Active Hai!**"
+        await chats_col.update_one(
+            {"_id": chat_id},
+            {"$set": {"delay": delay, "last_sent": 0}},
+            upsert=True
+        )
+        await message.edit_text(f"✅ **Chat added:** `{chat_id}` with delay `{delay}s`")
+
+    @userbot.on_message(filters.outgoing & filters.command("delchat", prefixes="."))
+    async def cmd_delchat(client: Client, message: Message):
+        if len(message.command) < 2:
+            await message.edit_text("❌ **Usage:** `.delchat <chat_id>`")
+            return
+
+        try:
+            chat_id = int(message.command[1])
+        except ValueError:
+            await message.edit_text("❌ **Chat ID must be an integer!**")
+            return
+
+        res = await chats_col.delete_one({"_id": chat_id})
+        if res.deleted_count > 0:
+            await message.edit_text(f"✅ **Chat removed:** `{chat_id}`")
+        else:
+            await message.edit_text(f"⚠️ **Chat not found:** `{chat_id}`")
+
+    @userbot.on_message(filters.outgoing & filters.command("listchats", prefixes="."))
+    async def cmd_listchats(client: Client, message: Message):
+        cursor = chats_col.find({})
+        chats = await cursor.to_list(length=500)
+        if not chats:
+            await message.edit_text("ℹ️ **No target chats configured.**")
+            return
+
+        text = "📋 **Target Broadcast Chats:**\n\n"
+        for idx, item in enumerate(chats, 1):
+            text += f"{idx}. `{item['_id']}` | Delay: `{item.get('delay', 60)}s`\n"
+        await message.edit_text(text)
+
+    @userbot.on_message(filters.outgoing & filters.command("setchatdelay", prefixes="."))
+    async def cmd_setchatdelay(client: Client, message: Message):
+        if len(message.command) < 3:
+            await message.edit_text("❌ **Usage:** `.setchatdelay <chat_id> <seconds>`")
+            return
+
+        try:
+            chat_id = int(message.command[1])
+            delay = int(message.command[2])
+        except ValueError:
+            await message.edit_text("❌ **Chat ID and delay must be integers!**")
+            return
+
+        res = await chats_col.update_one(
+            {"_id": chat_id},
+            {"$set": {"delay": delay}}
+        )
+        if res.matched_count > 0:
+            await message.edit_text(f"✅ **Updated delay for** `{chat_id}` **to** `{delay}s`")
+        else:
+            await message.edit_text(f"⚠️ **Chat** `{chat_id}` **not found in database.**")
+
+    @userbot.on_message(filters.outgoing & filters.command("setmsg", prefixes="."))
+    async def cmd_setmsg(client: Client, message: Message):
+        if len(message.command) < 2:
+            await message.edit_text("❌ **Usage:** `.setmsg <your_broadcast_text>`")
+            return
+
+        new_msg = message.text.split(maxsplit=1)[1]
+        await config_col.update_one(
+            {"_id": "global"},
+            {"$set": {"automsg_text": new_msg}},
+            upsert=True
+        )
+        await message.edit_text(f"✅ **Auto Broadcast Message updated:**\n\n{new_msg}")
+
+    @userbot.on_message(filters.outgoing & filters.command("automsg", prefixes="."))
+    async def cmd_automsg(client: Client, message: Message):
+        if len(message.command) < 2:
+            await message.edit_text("❌ **Usage:** `.automsg <on/off>`")
+            return
+
+        state = message.command[1].lower()
+        if state not in ["on", "off"]:
+            await message.edit_text("❌ **Choose either `on` or `off`.**")
+            return
+
+        is_on = (state == "on")
+        await config_col.update_one(
+            {"_id": "global"},
+            {"$set": {"automsg_enabled": is_on}},
+            upsert=True
+        )
+        status_text = "ENABLED 🚀" if is_on else "DISABLED 🛑"
+        await message.edit_text(f"🤖 **Auto Broadcast status:** `{status_text}`")
+
+    @userbot.on_message(filters.outgoing & filters.command("status", prefixes="."))
+    async def cmd_status(client: Client, message: Message):
+        cfg = await config_col.find_one({"_id": "global"}) or {}
+        fs = await fs_mgr.get_forcesub()
+        chat_count = await chats_col.count_documents({})
+
+        enabled = cfg.get("automsg_enabled", False)
+        automsg_text = cfg.get("automsg_text", "Not Set")
+
+        text = (
+            "📊 **System Status & Configuration**\n\n"
+            f"• **Auto Broadcast:** `{'ON' if enabled else 'OFF'}`\n"
+            f"• **ForceSub Channel:** `{fs if fs else 'Disabled'}`\n"
+            f"• **Target Chats Count:** `{chat_count}`\n"
+            f"• **Broadcast Text:**\n`{automsg_text}`"
+        )
+        await message.edit_text(text)
+
+    # ================= PM GUARD FOR USERBOT =================
+
+    @userbot.on_message(filters.private & ~filters.me & ~filters.bot)
+    async def userbot_pm_guard(client: Client, message: Message):
+        await fs_mgr.handle_pm_guard(client, message)
+
+    # ================= BOT API HANDLERS =================
+
+    @bot.on_message(filters.command("start"))
+    async def bot_start(client: Client, message: Message):
+        user_id = message.from_user.id
+        fs = await fs_mgr.get_forcesub()
+        if fs:
+            is_sub = await fs_mgr.check_user_subscribed(client, fs, user_id)
+            if not is_sub:
+                await fs_mgr.handle_pm_guard(client, message)
+                return
+
+        await message.reply_text(
+            "👋 **Hello!**\n"
+            "This Telegram Bot API instance is active and synced with the Userbot.\n\n"
+            "Use `/help` to view available commands."
         )
 
-
-    @dp.message(Command("help"))
-    async def bot_help(message):
-        await message.answer(
-            "🤖 **Bot Commands**\n\n"
-            "/start\n"
-            "/help\n"
-            "/status"
+    @bot.on_message(filters.command("help"))
+    async def bot_help(client: Client, message: Message):
+        await message.reply_text(
+            "ℹ️ **Bot API Help Menu**\n\n"
+            "• `/start` - Start the bot & verify subscription\n"
+            "• `/help` - Show this message\n"
+            "• `/status` - Check current broadcast status"
         )
 
+    @bot.on_message(filters.command("status"))
+    async def bot_status(client: Client, message: Message):
+        cfg = await config_col.find_one({"_id": "global"}) or {}
+        chat_count = await chats_col.count_documents({})
+        enabled = cfg.get("automsg_enabled", False)
+        fs = await fs_mgr.get_forcesub()
 
-    @dp.message(Command("status"))
-    async def bot_status(message):
-
-        chats = await get_chats()
-        channels = await force.get_force_channels()
-
-        await message.answer(
-            f"⚡ **Status:** "
-            f"`{await get_config('status', 'OFF')}`\n"
-            f"🔒 **ForceSub:** "
-            f"`{len(channels)}`\n"
-            f"🎯 **Chats:** "
-            f"`{len(chats)}`"
+        await message.reply_text(
+            "📊 **Bot Status**\n\n"
+            f"• **Broadcast Active:** `{'YES' if enabled else 'NO'}`\n"
+            f"• **Target Chats:** `{chat_count}`\n"
+            f"• **ForceSub:** `{fs if fs else 'Disabled'}`"
         )
+
+    # Catch-all PM handler that DOES NOT block commands
+    @bot.on_message(filters.private & ~filters.command(["start", "help", "status"]))
+    async def bot_pm_catchall(client: Client, message: Message):
+        is_ok = await fs_mgr.handle_pm_guard(client, message)
+        if is_ok:
+            await message.reply_text("📥 Message received. Please use commands to interact.")
