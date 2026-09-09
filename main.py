@@ -36,7 +36,6 @@ for var in REQUIRED_ENV_VARS:
 
 if missing_vars:
     logger.critical(f"❌ Missing or empty Environment Variable(s): {', '.join(missing_vars)}")
-    logger.critical("Check Render Environment settings for exact key spelling and non-empty values.")
     sys.exit(1)
 
 try:
@@ -90,18 +89,12 @@ async def auto_broadcast_worker():
                 continue
 
             # Verify ForceSub validity before broadcasting
-            fs = await fs_mgr.get_forcesub()
-            if fs:
+            fs_list = await fs_mgr.get_forcesubs()
+            for fs in fs_list:
                 try:
                     await userbot.get_chat(fs)
                 except Exception as e:
-                    logger.error(f"ForceSub channel check failed ({fs}): {e}. Turning off auto broadcast.")
-                    await config_col.update_one(
-                        {"_id": "global"},
-                        {"$set": {"automsg_enabled": False}},
-                        upsert=True
-                    )
-                    continue
+                    logger.error(f"ForceSub check failed ({fs}): {e}")
 
             cursor = chats_col.find({})
             async for item in cursor:
@@ -134,6 +127,12 @@ async def auto_broadcast_worker():
             logger.error(f"Unexpected error in broadcast worker loop: {global_ex}")
             await asyncio.sleep(10)
 
+async def dummy_health_check(reader, writer):
+    """Render ke Port Scan ko 200 OK dene ke liye dummy web server"""
+    writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+    await writer.drain()
+    writer.close()
+
 async def main():
     logger.info("Registering handlers...")
     register_handlers(userbot, bot, db, fs_mgr)
@@ -144,6 +143,11 @@ async def main():
     
     logger.info("Clients successfully started!")
 
+    # Render Port Server Binding Fix
+    port = int(os.environ.get("PORT", 8080))
+    server = await asyncio.start_server(dummy_health_check, "0.0.0.0", port)
+    logger.info(f"Dummy Web Server running on port {port} for Render health check.")
+
     # Start broadcast worker ONLY AFTER clients are fully started
     broadcast_task = asyncio.create_task(auto_broadcast_worker())
 
@@ -151,6 +155,8 @@ async def main():
     await idle()
 
     logger.info("Stopping system and cleaning up...")
+    server.close()
+    await server.wait_closed()
     broadcast_task.cancel()
     await userbot.stop()
     await bot.stop()
