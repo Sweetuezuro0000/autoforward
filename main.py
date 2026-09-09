@@ -4,9 +4,24 @@ import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 
+# =========================================================
+# PYROGRAM PEER-ID FIX
+# Pyrogram 2.0.106 has an outdated channel-id boundary.
+# This allows newer -100xxxxxxxxxxxx channel IDs.
+# =========================================================
+
+import pyrogram.utils
+
+pyrogram.utils.MIN_CHANNEL_ID = -1007852516352
+pyrogram.utils.MIN_CHAT_ID = -999999999999
+
+# =========================================================
+# IMPORTS
+# =========================================================
+
+from pyrogram import Client
 from aiogram import Bot, Dispatcher
 from motor.motor_asyncio import AsyncIOMotorClient
-from pyrogram import Client
 
 # =========================================================
 # LOGGING
@@ -60,7 +75,7 @@ app = Client(
 )
 
 # =========================================================
-# AIORGRAM BOT
+# TELEGRAM BOT
 # =========================================================
 
 tg_bot = Bot(BOT_TOKEN) if BOT_TOKEN else None
@@ -71,16 +86,18 @@ dp = Dispatcher()
 # =========================================================
 
 mongo_client = AsyncIOMotorClient(MONGO_URI)
+
 db = mongo_client[MONGO_DB]
 
 config_col = db["config"]
 chats_col = db["chats"]
 
 # =========================================================
-# CONFIG FUNCTIONS
+# MONGO CONFIG
 # =========================================================
 
 async def mongo_init():
+
     await config_col.update_one(
         {"_id": "status"},
         {"$setOnInsert": {"value": "OFF"}},
@@ -107,15 +124,22 @@ async def mongo_init():
 
 
 async def get_config(key, default=None):
-    doc = await config_col.find_one({"_id": key})
+
+    doc = await config_col.find_one(
+        {"_id": key}
+    )
 
     if not doc:
         return default
 
-    return doc.get("value", default)
+    return doc.get(
+        "value",
+        default
+    )
 
 
 async def set_config(key, value):
+
     await config_col.update_one(
         {"_id": key},
         {"$set": {"value": value}},
@@ -127,29 +151,39 @@ async def set_config(key, value):
 # =========================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
 
-    def log_message(self, format, *args):
+    def do_GET(self):
+
+        self.send_response(200)
+
+        self.end_headers()
+
+        self.wfile.write(
+            b"OK"
+        )
+
+    def log_message(self, *args):
         return
 
 
-def health_server():
+def start_health_server():
+
     server = ThreadingHTTPServer(
         ("0.0.0.0", PORT),
         HealthHandler
     )
 
-    log.info(f"Health server running on port {PORT}")
+    log.info(
+        f"Health server running on port {PORT}"
+    )
 
     server.serve_forever()
 
 
 def start_health_thread():
+
     Thread(
-        target=health_server,
+        target=start_health_server,
         daemon=True
     ).start()
 
@@ -158,29 +192,48 @@ def start_health_thread():
 # =========================================================
 
 async def main():
+
+    # Mongo first
     await mongo_init()
 
-    # Import handlers AFTER app/db are ready.
+    # Register handlers only after shared objects exist
     import force
     import bot
 
-    # Load FORCE_SUB from Render environment on startup.
+    # Load ForceSub from Render ENV
     if FORCE_SUB_ENV:
-        await force.load_force_sub_from_env(FORCE_SUB_ENV)
 
+        await force.load_force_sub_from_env(
+            FORCE_SUB_ENV
+        )
+
+    # Health server
     start_health_thread()
 
+    # IMPORTANT:
+    # Pyrogram must be started BEFORE broadcast worker
     await app.start()
 
-    log.info("🚀 Userbot started")
-    log.info("✅ MongoDB connected")
-    log.info("✅ Session commands loaded")
+    log.info(
+        "🚀 USERBOT STARTED"
+    )
 
+    log.info(
+        "✅ MongoDB connected"
+    )
+
+    log.info(
+        "✅ Session commands loaded"
+    )
+
+    # Start auto broadcaster AFTER app.start()
     asyncio.create_task(
         bot.broadcast_worker()
     )
 
+    # Start Bot API
     if tg_bot:
+
         await tg_bot.delete_webhook(
             drop_pending_updates=True
         )
@@ -192,10 +245,14 @@ async def main():
             )
         )
 
-        log.info("🤖 Bot API started")
+        log.info(
+            "🤖 BOT API STARTED"
+        )
 
+    # Keep process alive
     await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
+
     asyncio.run(main())
