@@ -20,7 +20,6 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from force import ForceSubManager
 from bot import register_handlers
 
-# Mandatory Config Validation
 REQUIRED_ENV_VARS = ["API_ID", "API_HASH", "STRING_SESSION", "BOT_TOKEN", "MONGO_URI"]
 env_data = {}
 missing_vars = []
@@ -49,7 +48,6 @@ STRING_SESSION = env_data["STRING_SESSION"]
 BOT_TOKEN = env_data["BOT_TOKEN"]
 MONGO_URI = env_data["MONGO_URI"]
 
-# MongoDB Initialization
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db = mongo_client["userbot_db"]
 config_col = db["config"]
@@ -57,7 +55,6 @@ chats_col = db["chats"]
 
 fs_mgr = ForceSubManager(db)
 
-# Hydrogram Clients Initialization
 userbot = Client(
     name="userbot_session",
     api_id=API_ID,
@@ -88,7 +85,6 @@ async def auto_broadcast_worker():
             if not automsg_text:
                 continue
 
-            # Verify ForceSub validity before broadcasting
             fs_list = await fs_mgr.get_forcesubs()
             for fs in fs_list:
                 try:
@@ -128,27 +124,25 @@ async def auto_broadcast_worker():
             await asyncio.sleep(10)
 
 async def dummy_health_check(reader, writer):
-    """Render ke Port Scan ko 200 OK dene ke liye dummy web server"""
     writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
     await writer.drain()
     writer.close()
 
 async def main():
-    logger.info("Registering handlers...")
-    register_handlers(userbot, bot, db, fs_mgr)
-
     logger.info("Starting Hydrogram Userbot and Bot API clients...")
     await userbot.start()
     await bot.start()
-    
     logger.info("Clients successfully started!")
+
+    # Register handlers AFTER clients start so Owner ID is dynamically detected
+    logger.info("Registering handlers...")
+    register_handlers(userbot, bot, db, fs_mgr)
 
     # Render Port Server Binding Fix
     port = int(os.environ.get("PORT", 8080))
     server = await asyncio.start_server(dummy_health_check, "0.0.0.0", port)
     logger.info(f"Dummy Web Server running on port {port} for Render health check.")
 
-    # Start broadcast worker ONLY AFTER clients are fully started
     broadcast_task = asyncio.create_task(auto_broadcast_worker())
 
     logger.info("System is up and running.")
