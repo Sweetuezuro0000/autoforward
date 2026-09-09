@@ -1,4 +1,3 @@
-```python
 from pyrogram import filters
 from pyrogram.enums import ChatMemberStatus
 from pyrogram.types import Message
@@ -422,4 +421,3 @@ if tg_bot:
             )
         except Exception:
             pass
-```
