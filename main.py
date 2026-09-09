@@ -1,258 +1,143 @@
+import os
+import sys
+import time
 import asyncio
 import logging
-import os
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Thread
+from dotenv import load_dotenv
 
-# =========================================================
-# PYROGRAM PEER-ID FIX
-# Pyrogram 2.0.106 has an outdated channel-id boundary.
-# This allows newer -100xxxxxxxxxxxx channel IDs.
-# =========================================================
-
-import pyrogram.utils
-
-pyrogram.utils.MIN_CHANNEL_ID = -1007852516352
-pyrogram.utils.MIN_CHAT_ID = -999999999999
-
-# =========================================================
-# IMPORTS
-# =========================================================
-
-from pyrogram import Client
-from aiogram import Bot, Dispatcher
-from motor.motor_asyncio import AsyncIOMotorClient
-
-# =========================================================
-# LOGGING
-# =========================================================
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
+logger = logging.getLogger("Main")
 
-log = logging.getLogger("autoforward")
+from pyrogram import Client, idle
+from pyrogram.errors import FloodWait, RPCError
+from motor.motor_asyncio import AsyncIOMotorClient
 
-# =========================================================
-# ENVIRONMENT
-# =========================================================
+from force import ForceSubManager
+from bot import register_handlers
 
-API_ID = int(os.environ.get("API_ID", "0"))
-API_HASH = os.environ.get("API_HASH", "")
-SESSION_STRING = os.environ.get("SESSION_STRING", "")
+# Mandatory Config Checks
+API_ID = os.getenv("API_ID")
+API_HASH = os.getenv("API_HASH")
+STRING_SESSION = os.getenv("STRING_SESSION")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+MONGO_URI = os.getenv("MONGO_URI")
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+if not all([API_ID, API_HASH, STRING_SESSION, BOT_TOKEN, MONGO_URI]):
+    logger.critical("Missing required environment variables! Check API_ID, API_HASH, STRING_SESSION, BOT_TOKEN, MONGO_URI.")
+    sys.exit(1)
 
-MONGO_URI = os.environ.get("MONGO_URI", "")
-MONGO_DB = os.environ.get("MONGO_DB", "autoforward")
+API_ID = int(API_ID)
 
-FORCE_SUB_ENV = os.environ.get("FORCE_SUB", "")
-
-PORT = int(os.environ.get("PORT", "10000"))
-
-if not API_ID:
-    raise RuntimeError("API_ID missing")
-
-if not API_HASH:
-    raise RuntimeError("API_HASH missing")
-
-if not SESSION_STRING:
-    raise RuntimeError("SESSION_STRING missing")
-
-if not MONGO_URI:
-    raise RuntimeError("MONGO_URI missing")
-
-# =========================================================
-# PYROGRAM USERBOT
-# =========================================================
-
-app = Client(
-    "userbot_session",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=SESSION_STRING,
-)
-
-# =========================================================
-# TELEGRAM BOT
-# =========================================================
-
-tg_bot = Bot(BOT_TOKEN) if BOT_TOKEN else None
-dp = Dispatcher()
-
-# =========================================================
-# MONGODB
-# =========================================================
-
+# MongoDB Initialization
 mongo_client = AsyncIOMotorClient(MONGO_URI)
-
-db = mongo_client[MONGO_DB]
-
+db = mongo_client["userbot_db"]
 config_col = db["config"]
 chats_col = db["chats"]
 
-# =========================================================
-# MONGO CONFIG
-# =========================================================
+fs_mgr = ForceSubManager(db)
 
-async def mongo_init():
+# Pyrogram / Hydrogram Clients Initialization
+userbot = Client(
+    name="userbot_session",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    session_string=STRING_SESSION,
+    in_memory=True
+)
 
-    await config_col.update_one(
-        {"_id": "status"},
-        {"$setOnInsert": {"value": "OFF"}},
-        upsert=True
-    )
+bot = Client(
+    name="bot_session",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    in_memory=True
+)
 
-    await config_col.update_one(
-        {"_id": "delay"},
-        {"$setOnInsert": {"value": 8}},
-        upsert=True
-    )
+async def auto_broadcast_worker():
+    logger.info("Auto Broadcast Worker task initiated.")
+    while True:
+        try:
+            await asyncio.sleep(5)
+            
+            cfg = await config_col.find_one({"_id": "global"}) or {}
+            if not cfg.get("automsg_enabled", False):
+                continue
 
-    await config_col.update_one(
-        {"_id": "msg"},
-        {"$setOnInsert": {"value": "Default Message"}},
-        upsert=True
-    )
+            automsg_text = cfg.get("automsg_text")
+            if not automsg_text:
+                continue
 
-    await config_col.update_one(
-        {"_id": "force_sub"},
-        {"$setOnInsert": {"value": []}},
-        upsert=True
-    )
+            # Verify ForceSub validity before broadcasting
+            fs = await fs_mgr.get_forcesub()
+            if fs:
+                try:
+                    await userbot.get_chat(fs)
+                except Exception as e:
+                    logger.error(f"ForceSub channel check failed ({fs}): {e}. Turning off auto broadcast.")
+                    await config_col.update_one(
+                        {"_id": "global"},
+                        {"$set": {"automsg_enabled": False}},
+                        upsert=True
+                    )
+                    continue
 
+            cursor = chats_col.find({})
+            async for item in cursor:
+                chat_id = item["_id"]
+                delay = item.get("delay", 60)
+                last_sent = item.get("last_sent", 0)
 
-async def get_config(key, default=None):
+                now = time.time()
+                if now - last_sent < delay:
+                    continue
 
-    doc = await config_col.find_one(
-        {"_id": key}
-    )
+                try:
+                    await userbot.send_message(chat_id, automsg_text)
+                    await chats_col.update_one(
+                        {"_id": chat_id},
+                        {"$set": {"last_sent": time.time()}}
+                    )
+                    logger.info(f"Broadcast sent successfully to chat: {chat_id}")
+                except FloodWait as fw:
+                    logger.warning(f"FloodWait hit on chat {chat_id}. Sleeping for {fw.value + 2}s")
+                    await asyncio.sleep(fw.value + 2)
+                except RPCError as rpc:
+                    logger.error(f"RPC Error on chat {chat_id}: {rpc}")
+                except Exception as ex:
+                    logger.error(f"Failed to send broadcast to {chat_id}: {ex}")
 
-    if not doc:
-        return default
-
-    return doc.get(
-        "value",
-        default
-    )
-
-
-async def set_config(key, value):
-
-    await config_col.update_one(
-        {"_id": key},
-        {"$set": {"value": value}},
-        upsert=True
-    )
-
-# =========================================================
-# HEALTH SERVER
-# =========================================================
-
-class HealthHandler(BaseHTTPRequestHandler):
-
-    def do_GET(self):
-
-        self.send_response(200)
-
-        self.end_headers()
-
-        self.wfile.write(
-            b"OK"
-        )
-
-    def log_message(self, *args):
-        return
-
-
-def start_health_server():
-
-    server = ThreadingHTTPServer(
-        ("0.0.0.0", PORT),
-        HealthHandler
-    )
-
-    log.info(
-        f"Health server running on port {PORT}"
-    )
-
-    server.serve_forever()
-
-
-def start_health_thread():
-
-    Thread(
-        target=start_health_server,
-        daemon=True
-    ).start()
-
-# =========================================================
-# MAIN
-# =========================================================
+        except asyncio.CancelledError:
+            break
+        except Exception as global_ex:
+            logger.error(f"Unexpected error in broadcast worker loop: {global_ex}")
+            await asyncio.sleep(10)
 
 async def main():
+    logger.info("Registering handlers...")
+    register_handlers(userbot, bot, db, fs_mgr)
 
-    # Mongo first
-    await mongo_init()
+    logger.info("Starting Pyrogram Userbot and Bot API clients...")
+    await userbot.start()
+    await bot.start()
+    
+    logger.info("Clients successfully started!")
 
-    # Register handlers only after shared objects exist
-    import force
-    import bot
+    # Start broadcast worker ONLY AFTER clients are fully started
+    broadcast_task = asyncio.create_task(auto_broadcast_worker())
 
-    # Load ForceSub from Render ENV
-    if FORCE_SUB_ENV:
+    logger.info("System is up and running.")
+    await idle()
 
-        await force.load_force_sub_from_env(
-            FORCE_SUB_ENV
-        )
-
-    # Health server
-    start_health_thread()
-
-    # IMPORTANT:
-    # Pyrogram must be started BEFORE broadcast worker
-    await app.start()
-
-    log.info(
-        "🚀 USERBOT STARTED"
-    )
-
-    log.info(
-        "✅ MongoDB connected"
-    )
-
-    log.info(
-        "✅ Session commands loaded"
-    )
-
-    # Start auto broadcaster AFTER app.start()
-    asyncio.create_task(
-        bot.broadcast_worker()
-    )
-
-    # Start Bot API
-    if tg_bot:
-
-        await tg_bot.delete_webhook(
-            drop_pending_updates=True
-        )
-
-        asyncio.create_task(
-            dp.start_polling(
-                tg_bot,
-                allowed_updates=dp.resolve_used_update_types()
-            )
-        )
-
-        log.info(
-            "🤖 BOT API STARTED"
-        )
-
-    # Keep process alive
-    await asyncio.Event().wait()
-
+    logger.info("Stopping system and cleaning up...")
+    broadcast_task.cancel()
+    await userbot.stop()
+    await bot.stop()
 
 if __name__ == "__main__":
-
-    asyncio.run(main())
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
