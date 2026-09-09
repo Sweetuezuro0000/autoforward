@@ -1,89 +1,137 @@
-import os
 import logging
-from hydrogram import Client, filters
-from hydrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from hydrogram.errors import UserNotParticipant, ChatAdminRequired, PeerIdInvalid, ChannelInvalid
-from motor.motor_asyncio import AsyncIOMotorDatabase
+from hydrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from hydrogram.errors import UserNotParticipant, RPCError
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_FSUB_TEXT = (
+    "⚠️ **Access Restricted!**\n\n"
+    "Is Bot / Group ko use karne ke liye aapko hamare sabhi official channels join karne honge.\n"
+    "Niche diye gaye buttons par click karke join karein aur **Verify / Check** button dabayein."
+)
+
 class ForceSubManager:
-    def __init__(self, db: AsyncIOMotorDatabase):
-        self.db = db
-        self.config = db["config"]
+    def __init__(self, db):
+        self.config_col = db["config"]
 
-    async def get_forcesub(self):
-        doc = await self.config.find_one({"_id": "global"})
-        if doc and "forcesub" in doc:
-            return doc["forcesub"]
-        env_fs = os.getenv("FORCE_SUB")
-        if env_fs:
-            try:
-                return int(env_fs)
-            except ValueError:
-                return env_fs
-        return None
+    # --- Channel Management ---
+    async def get_forcesubs(self) -> list:
+        cfg = await self.config_col.find_one({"_id": "global"}) or {}
+        return cfg.get("forcesub_channels", [])
 
-    async def set_forcesub(self, channel_id_or_username):
-        await self.config.update_one(
-            {"_id": "global"},
-            {"$set": {"forcesub": channel_id_or_username}},
-            upsert=True
-        )
-
-    async def remove_forcesub(self):
-        await self.config.update_one(
-            {"_id": "global"},
-            {"$unset": {"forcesub": ""}},
-            upsert=True
-        )
-
-    async def check_user_subscribed(self, client: Client, channel, user_id: int) -> bool:
-        try:
-            member = await client.get_chat_member(channel, user_id)
-            if member.status in ["kicked", "banned"]:
-                return False
-            return True
-        except UserNotParticipant:
-            return False
-        except (ChatAdminRequired, PeerIdInvalid, ChannelInvalid) as e:
-            logger.error(f"ForceSub check failed for channel {channel}: {e}")
-            return True
-        except Exception as e:
-            logger.error(f"Unexpected error in ForceSub check: {e}")
-            return True
-
-    async def get_invite_link(self, client: Client, channel) -> str:
-        try:
-            chat = await client.get_chat(channel)
-            if chat.invite_link:
-                return chat.invite_link
-            if chat.username:
-                return f"https://t.me/{chat.username}"
-            link = await client.export_chat_invite_link(channel)
-            return link
-        except Exception as e:
-            logger.error(f"Error getting invite link for {channel}: {e}")
-            return "https://t.me"
-
-    async def handle_pm_guard(self, client: Client, message: Message) -> bool:
-        forcesub = await self.get_forcesub()
-        if not forcesub:
-            return True
-
-        if message.from_user is None or message.from_user.is_bot:
-            return True
-
-        user_id = message.from_user.id
-        is_sub = await self.check_user_subscribed(client, forcesub, user_id)
-        if not is_sub:
-            invite_link = await self.get_invite_link(client, forcesub)
-            await message.reply_text(
-                "⚠️ **Access Denied!**\n\n"
-                "To send messages or use this bot, you must join our updates channel first.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📢 Join Channel", url=invite_link)]
-                ])
+    async def add_forcesub(self, channel_id_or_username: str) -> list:
+        channels = await self.get_forcesubs()
+        if channel_id_or_username not in channels:
+            channels.append(channel_id_or_username)
+            await self.config_col.update_one(
+                {"_id": "global"},
+                {"$set": {"forcesub_channels": channels}},
+                upsert=True
             )
-            return False
-        return True
+        return channels
+
+    async def remove_forcesub(self, channel_id_or_username: str) -> list:
+        channels = await self.get_forcesubs()
+        if channel_id_or_username in channels:
+            channels.remove(channel_id_or_username)
+            await self.config_col.update_one(
+                {"_id": "global"},
+                {"$set": {"forcesub_channels": channels}},
+                upsert=True
+            )
+        return channels
+
+    async def clear_forcesubs(self):
+        await self.config_col.update_one(
+            {"_id": "global"},
+            {"$set": {"forcesub_channels": []}},
+            upsert=True
+        )
+
+    # --- Custom Text & Buttons Management ---
+    async def get_forcesub_text(self) -> str:
+        cfg = await self.config_col.find_one({"_id": "global"}) or {}
+        return cfg.get("forcesub_text", DEFAULT_FSUB_TEXT)
+
+    async def set_forcesub_text(self, text: str):
+        await self.config_col.update_one(
+            {"_id": "global"},
+            {"$set": {"forcesub_text": text}},
+            upsert=True
+        )
+
+    async def get_custom_buttons(self) -> list:
+        cfg = await self.config_col.find_one({"_id": "global"}) or {}
+        return cfg.get("custom_buttons", [])
+
+    async def add_custom_button(self, label: str, url: str) -> list:
+        buttons = await self.get_custom_buttons()
+        buttons.append({"label": label, "url": url})
+        await self.config_col.update_one(
+            {"_id": "global"},
+            {"$set": {"custom_buttons": buttons}},
+            upsert=True
+        )
+        return buttons
+
+    async def remove_custom_button(self, index: int) -> list:
+        buttons = await self.get_custom_buttons()
+        if 0 <= index < len(buttons):
+            buttons.pop(index)
+            await self.config_col.update_one(
+                {"_id": "global"},
+                {"$set": {"custom_buttons": buttons}},
+                upsert=True
+            )
+        return buttons
+
+    async def clear_custom_buttons(self):
+        await self.config_col.update_one(
+            {"_id": "global"},
+            {"$set": {"custom_buttons": []}},
+            upsert=True
+        )
+
+    # --- Verification & Markup Generator ---
+    async def get_unjoined_channels(self, client, user_id: int) -> list:
+        channels = await self.get_forcesubs()
+        unjoined = []
+
+        for ch in channels:
+            try:
+                target = int(ch) if (ch.startswith("-100") or ch.isdigit()) else ch
+                member = await client.get_chat_member(target, user_id)
+                if member.status in ["kicked", "left"]:
+                    unjoined.append(ch)
+            except UserNotParticipant:
+                unjoined.append(ch)
+            except Exception as e:
+                logger.error(f"Error checking ForceSub for {ch}: {e}")
+                unjoined.append(ch)
+
+        return unjoined
+
+    async def build_forcesub_markup(self, client, unjoined_channels: list) -> InlineKeyboardMarkup:
+        keyboard = []
+        
+        # 1. Dynamic Unjoined Channel Links
+        for idx, ch in enumerate(unjoined_channels, start=1):
+            try:
+                chat = await client.get_chat(ch)
+                invite_link = chat.invite_link or (f"https://t.me/{chat.username}" if chat.username else None)
+                if not invite_link:
+                    invite_link = await client.export_chat_invite_link(chat.id)
+
+                keyboard.append([InlineKeyboardButton(f"📢 Join Channel #{idx} ({chat.title[:15]})", url=invite_link)])
+            except Exception as e:
+                logger.error(f"Could not build button for {ch}: {e}")
+
+        # 2. Check / Verify Button
+        keyboard.append([InlineKeyboardButton("🔄 Check / Verify Joined", callback_data="check_forcesub")])
+
+        # 3. Custom Editable Buttons
+        custom_btns = await self.get_custom_buttons()
+        for btn in custom_btns:
+            keyboard.append([InlineKeyboardButton(btn["label"], url=btn["url"])])
+
+        return InlineKeyboardMarkup(keyboard)
