@@ -13,8 +13,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("Main")
 
-from pyrogram import Client, idle
-from pyrogram.errors import FloodWait, RPCError
+from hydrogram import Client, idle
+from hydrogram.errors import FloodWait, RPCError
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from force import ForceSubManager
@@ -41,7 +41,7 @@ chats_col = db["chats"]
 
 fs_mgr = ForceSubManager(db)
 
-# Pyrogram / Hydrogram Clients Initialization
+# Hydrogram Clients Initialization
 userbot = Client(
     name="userbot_session",
     api_id=API_ID,
@@ -121,7 +121,7 @@ async def main():
     logger.info("Registering handlers...")
     register_handlers(userbot, bot, db, fs_mgr)
 
-    logger.info("Starting Pyrogram Userbot and Bot API clients...")
+    logger.info("Starting Hydrogram Userbot and Bot API clients...")
     await userbot.start()
     await bot.start()
     
