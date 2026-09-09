@@ -1,4 +1,3 @@
-```python
 import asyncio
 import time
 
@@ -587,4 +586,3 @@ if True:
             f"🎯 **Chats:** "
             f"`{len(chats)}`"
         )
-```
