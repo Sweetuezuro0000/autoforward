@@ -1,6 +1,6 @@
 import logging
 from hydrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from hydrogram.errors import UserNotParticipant, RPCError
+from hydrogram.errors import UserNotParticipant
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +99,7 @@ class ForceSubManager:
 
         for ch in channels:
             try:
-                target = int(ch) if (ch.startswith("-100") or ch.isdigit()) else ch
+                target = int(ch) if (ch.startswith("-100") or (ch.startswith("-") and ch[1:].isdigit()) or ch.isdigit()) else ch
                 member = await client.get_chat_member(target, user_id)
                 if member.status in ["kicked", "left"]:
                     unjoined.append(ch)
@@ -114,10 +114,10 @@ class ForceSubManager:
     async def build_forcesub_markup(self, client, unjoined_channels: list) -> InlineKeyboardMarkup:
         keyboard = []
         
-        # 1. Dynamic Unjoined Channel Links
         for idx, ch in enumerate(unjoined_channels, start=1):
             try:
-                chat = await client.get_chat(ch)
+                target = int(ch) if (ch.startswith("-100") or (ch.startswith("-") and ch[1:].isdigit()) or ch.isdigit()) else ch
+                chat = await client.get_chat(target)
                 invite_link = chat.invite_link or (f"https://t.me/{chat.username}" if chat.username else None)
                 if not invite_link:
                     invite_link = await client.export_chat_invite_link(chat.id)
@@ -126,10 +126,8 @@ class ForceSubManager:
             except Exception as e:
                 logger.error(f"Could not build button for {ch}: {e}")
 
-        # 2. Check / Verify Button
         keyboard.append([InlineKeyboardButton("🔄 Check / Verify Joined", callback_data="check_forcesub")])
 
-        # 3. Custom Editable Buttons
         custom_btns = await self.get_custom_buttons()
         for btn in custom_btns:
             keyboard.append([InlineKeyboardButton(btn["label"], url=btn["url"])])
