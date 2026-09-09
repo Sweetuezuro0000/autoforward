@@ -14,7 +14,6 @@ class ForceSubManager:
     def __init__(self, db):
         self.config_col = db["config"]
 
-    # --- Channel Management ---
     async def get_forcesubs(self) -> list:
         cfg = await self.config_col.find_one({"_id": "global"}) or {}
         return cfg.get("forcesub_channels", [])
@@ -48,7 +47,6 @@ class ForceSubManager:
             upsert=True
         )
 
-    # --- Custom Text & Buttons Management ---
     async def get_forcesub_text(self) -> str:
         cfg = await self.config_col.find_one({"_id": "global"}) or {}
         return cfg.get("forcesub_text", DEFAULT_FSUB_TEXT)
@@ -92,7 +90,6 @@ class ForceSubManager:
             upsert=True
         )
 
-    # --- Verification & Markup Generator ---
     async def get_unjoined_channels(self, client, user_id: int) -> list:
         channels = await self.get_forcesubs()
         unjoined = []
@@ -122,7 +119,7 @@ class ForceSubManager:
                 if not invite_link:
                     invite_link = await client.export_chat_invite_link(chat.id)
 
-                keyboard.append([InlineKeyboardButton(f"📢 Join Channel #{idx} ({chat.title[:15]})", url=invite_link)])
+                keyboard.append([InlineKeyboardButton(f"📢 Join Channel #{idx}", url=invite_link)])
             except Exception as e:
                 logger.error(f"Could not build button for {ch}: {e}")
 
