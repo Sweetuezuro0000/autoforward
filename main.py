@@ -20,18 +20,35 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from force import ForceSubManager
 from bot import register_handlers
 
-# Mandatory Config Checks
-API_ID = os.getenv("API_ID")
-API_HASH = os.getenv("API_HASH")
-STRING_SESSION = os.getenv("STRING_SESSION")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-MONGO_URI = os.getenv("MONGO_URI")
+# Mandatory Config Validation
+REQUIRED_ENV_VARS = ["API_ID", "API_HASH", "STRING_SESSION", "BOT_TOKEN", "MONGO_URI"]
+env_data = {}
+missing_vars = []
 
-if not all([API_ID, API_HASH, STRING_SESSION, BOT_TOKEN, MONGO_URI]):
-    logger.critical("Missing required environment variables! Check API_ID, API_HASH, STRING_SESSION, BOT_TOKEN, MONGO_URI.")
+for var in REQUIRED_ENV_VARS:
+    val = os.environ.get(var)
+    if val is not None:
+        val = val.strip().strip("'").strip('"')
+    if not val:
+        missing_vars.append(var)
+    else:
+        env_data[var] = val
+
+if missing_vars:
+    logger.critical(f"❌ Missing or empty Environment Variable(s): {', '.join(missing_vars)}")
+    logger.critical("Check Render Environment settings for exact key spelling and non-empty values.")
     sys.exit(1)
 
-API_ID = int(API_ID)
+try:
+    API_ID = int(env_data["API_ID"])
+except ValueError:
+    logger.critical("❌ API_ID must be a valid integer!")
+    sys.exit(1)
+
+API_HASH = env_data["API_HASH"]
+STRING_SESSION = env_data["STRING_SESSION"]
+BOT_TOKEN = env_data["BOT_TOKEN"]
+MONGO_URI = env_data["MONGO_URI"]
 
 # MongoDB Initialization
 mongo_client = AsyncIOMotorClient(MONGO_URI)
