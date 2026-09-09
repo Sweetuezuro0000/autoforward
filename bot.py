@@ -1,241 +1,197 @@
+import asyncio
 import logging
-from hydrogram import Client, filters
-from hydrogram.types import Message
-from motor.motor_asyncio import AsyncIOMotorDatabase
-from force import ForceSubManager
+from hydrogram import filters, Client
+from hydrogram.types import Message, CallbackQuery
 
 logger = logging.getLogger(__name__)
 
-def register_handlers(userbot: Client, bot: Client, db: AsyncIOMotorDatabase, fs_mgr: ForceSubManager):
-    config_col = db["config"]
-    chats_col = db["chats"]
+# Map to store forwarded messages for replying: {forwarded_msg_id: original_sender_id}
+FORWARD_MAP = {}
 
-    # ================= USERBOT COMMANDS (filters.outgoing) =================
+def register_handlers(userbot: Client, bot: Client, db, fs_mgr):
 
-    @userbot.on_message(filters.outgoing & filters.command("help", prefixes="."))
-    async def cmd_userbot_help(client: Client, message: Message):
-        text = (
-            "🤖 **Userbot Command Panel**\n\n"
-            "• `.help` - Show this menu\n"
-            "• `.forcesub <channel_id/username>` - Set ForceSub channel\n"
-            "• `.forcesuboff` - Disable ForceSub\n"
-            "• `.addchat <chat_id> [delay]` - Add chat to auto broadcast\n"
-            "• `.delchat <chat_id>` - Remove chat from auto broadcast\n"
-            "• `.listchats` - List all broadcast chats\n"
-            "• `.setchatdelay <chat_id> <seconds>` - Update per-chat delay\n"
-            "• `.setmsg <message>` - Set auto broadcast message\n"
-            "• `.automsg <on/off>` - Enable or Disable auto broadcast\n"
-            "• `.status` - View current configuration & status"
-        )
-        await message.edit_text(text)
+    # ==========================================
+    # 1. USERBOT COMMANDS (Admin Controls)
+    # ==========================================
 
-    @userbot.on_message(filters.outgoing & filters.command("forcesub", prefixes="."))
-    async def cmd_set_forcesub(client: Client, message: Message):
+    # --- Channel Management Commands ---
+    @userbot.on_message(filters.command("forcesub", prefixes=".") & filters.outgoing)
+    async def add_fs_cmd(client: Client, message: Message):
         if len(message.command) < 2:
-            await message.edit_text("❌ **Usage:** `.forcesub <channel_id or @username>`")
-            return
-        target = message.command[1]
-        try:
-            target = int(target)
-        except ValueError:
-            pass
+            return await message.reply_text("❌ **Usage:** `.forcesub <channel_id or @username>`")
 
+        ch = message.command[1]
         try:
-            chat = await client.get_chat(target)
-            target_id = chat.id
+            chat = await client.get_chat(ch)
+            ch_identifier = str(chat.id)
+            updated = await fs_mgr.add_forcesub(ch_identifier)
+            await message.reply_text(f"✅ **Added to ForceSub:** {chat.title} (`{ch_identifier}`)\n\n**Total Channels:** {len(updated)}")
         except Exception as e:
-            await message.edit_text(f"❌ **Invalid Channel/Peer ID:** `{e}`")
-            return
+            await message.reply_text(f"❌ **Error:** {e}\nMake sure Userbot & Bot are Admins in the channel.")
 
-        await fs_mgr.set_forcesub(target_id)
-        await message.edit_text(f"✅ **ForceSub set to:** `{target_id}`")
-
-    @userbot.on_message(filters.outgoing & filters.command("forcesuboff", prefixes="."))
-    async def cmd_forcesuboff(client: Client, message: Message):
-        await fs_mgr.remove_forcesub()
-        await message.edit_text("✅ **ForceSub has been disabled.**")
-
-    @userbot.on_message(filters.outgoing & filters.command("addchat", prefixes="."))
-    async def cmd_addchat(client: Client, message: Message):
+    @userbot.on_message(filters.command("delforcesub", prefixes=".") & filters.outgoing)
+    async def del_fs_cmd(client: Client, message: Message):
         if len(message.command) < 2:
-            await message.edit_text("❌ **Usage:** `.addchat <chat_id> [delay_in_seconds]`")
-            return
+            return await message.reply_text("❌ **Usage:** `.delforcesub <channel_id or @username>`")
+
+        ch = message.command[1]
+        updated = await fs_mgr.remove_forcesub(ch)
+        await message.reply_text(f"🗑️ **Removed from ForceSub.**\n\n**Remaining Channels:** {len(updated)}")
+
+    @userbot.on_message(filters.command("forcesublist", prefixes=".") & filters.outgoing)
+    async def list_fs_cmd(client: Client, message: Message):
+        channels = await fs_mgr.get_forcesubs()
+        if not channels:
+            return await message.reply_text("ℹ️ No active ForceSub channels.")
+
+        text = "📋 **Active ForceSub Channels:**\n\n"
+        for idx, ch in enumerate(channels, start=1):
+            text += f"{idx}. `{ch}`\n"
+        await message.reply_text(text)
+
+    @userbot.on_message(filters.command("forcesuboff", prefixes=".") & filters.outgoing)
+    async def clear_fs_cmd(client: Client, message: Message):
+        await fs_mgr.clear_forcesubs()
+        await message.reply_text("🚫 **All ForceSub channels disabled!**")
+
+    # --- Custom Text & Buttons Commands ---
+    @userbot.on_message(filters.command("setfsubmsg", prefixes=".") & filters.outgoing)
+    async def set_fsub_msg_cmd(client: Client, message: Message):
+        if len(message.command) < 2:
+            return await message.reply_text("❌ **Usage:** `.setfsubmsg <New Message Text>`")
+
+        new_text = message.text.split(maxsplit=1)[1]
+        await fs_mgr.set_forcesub_text(new_text)
+        await message.reply_text("✅ **ForceSub Message Updated!**")
+
+    @userbot.on_message(filters.command("addbutton", prefixes=".") & filters.outgoing)
+    async def add_btn_cmd(client: Client, message: Message):
+        # Format: .addbutton Label | https://link.com
+        if "|" not in message.text:
+            return await message.reply_text("❌ **Usage:** `.addbutton Button Label | https://example.com`")
 
         try:
-            chat_id = int(message.command[1])
-        except ValueError:
-            await message.edit_text("❌ **Chat ID must be an integer!**")
-            return
+            raw_data = message.text.split(maxsplit=1)[1]
+            label, url = map(str.strip, raw_data.split("|", 1))
+            updated = await fs_mgr.add_custom_button(label, url)
+            await message.reply_text(f"✅ **Button Added:** [{label}]({url})\nTotal Extra Buttons: {len(updated)}")
+        except Exception as e:
+            await message.reply_text(f"❌ Error: {e}")
 
-        delay = 60
-        if len(message.command) >= 3:
+    @userbot.on_message(filters.command("delbutton", prefixes=".") & filters.outgoing)
+    async def del_btn_cmd(client: Client, message: Message):
+        if len(message.command) < 2 or not message.command[1].isdigit():
+            return await message.reply_text("❌ **Usage:** `.delbutton <button_number>` (e.g. `.delbutton 1`)")
+
+        idx = int(message.command[1]) - 1
+        updated = await fs_mgr.remove_custom_button(idx)
+        await message.reply_text(f"🗑️ **Button Removed.** Remaining Custom Buttons: {len(updated)}")
+
+    @userbot.on_message(filters.command("listbuttons", prefixes=".") & filters.outgoing)
+    async def list_btns_cmd(client: Client, message: Message):
+        btns = await fs_mgr.get_custom_buttons()
+        if not btns:
+            return await message.reply_text("ℹ️ No custom buttons set.")
+
+        text = "🔘 **Custom Extra Buttons:**\n\n"
+        for idx, b in enumerate(btns, start=1):
+            text += f"{idx}. [{b['label']}]({b['url']})\n"
+        await message.reply_text(text)
+
+    @userbot.on_message(filters.command("clearbuttons", prefixes=".") & filters.outgoing)
+    async def clear_btns_cmd(client: Client, message: Message):
+        await fs_mgr.clear_custom_buttons()
+        await message.reply_text("🚫 **All custom extra buttons removed!**")
+
+
+    # ==========================================
+    # 2. BOT API HANDLERS (PM + Group + Forward)
+    # ==========================================
+
+    # --- Verification Callback Button ---
+    @bot.on_callback_query(filters.regex("^check_forcesub$"))
+    async def check_fs_callback(client: Client, callback: CallbackQuery):
+        user_id = callback.from_user.id
+        unjoined = await fs_mgr.get_unjoined_channels(client, user_id)
+
+        if not unjoined:
+            await callback.answer("✅ Aapne sabhi channels join kar liye hain!", show_alert=True)
             try:
-                delay = int(message.command[2])
-            except ValueError:
+                await callback.message.delete()
+            except Exception:
                 pass
-
-        await chats_col.update_one(
-            {"_id": chat_id},
-            {"$set": {"delay": delay, "last_sent": 0}},
-            upsert=True
-        )
-        await message.edit_text(f"✅ **Chat added:** `{chat_id}` with delay `{delay}s`")
-
-    @userbot.on_message(filters.outgoing & filters.command("delchat", prefixes="."))
-    async def cmd_delchat(client: Client, message: Message):
-        if len(message.command) < 2:
-            await message.edit_text("❌ **Usage:** `.delchat <chat_id>`")
-            return
-
-        try:
-            chat_id = int(message.command[1])
-        except ValueError:
-            await message.edit_text("❌ **Chat ID must be an integer!**")
-            return
-
-        res = await chats_col.delete_one({"_id": chat_id})
-        if res.deleted_count > 0:
-            await message.edit_text(f"✅ **Chat removed:** `{chat_id}`")
         else:
-            await message.edit_text(f"⚠️ **Chat not found:** `{chat_id}`")
+            await callback.answer("❌ Aapne abhi tak saare channels join nahi kiye hain!", show_alert=True)
 
-    @userbot.on_message(filters.outgoing & filters.command("listchats", prefixes="."))
-    async def cmd_listchats(client: Client, message: Message):
-        cursor = chats_col.find({})
-        chats = await cursor.to_list(length=500)
-        if not chats:
-            await message.edit_text("ℹ️ **No target chats configured.**")
+    # --- Group ForceSub Guard ---
+    @bot.on_message(filters.group & ~filters.me)
+    async def group_forcesub_guard(client: Client, message: Message):
+        if not message.from_user:
             return
 
-        text = "📋 **Target Broadcast Chats:**\n\n"
-        for idx, item in enumerate(chats, 1):
-            text += f"{idx}. `{item['_id']}` | Delay: `{item.get('delay', 60)}s`\n"
-        await message.edit_text(text)
-
-    @userbot.on_message(filters.outgoing & filters.command("setchatdelay", prefixes="."))
-    async def cmd_setchatdelay(client: Client, message: Message):
-        if len(message.command) < 3:
-            await message.edit_text("❌ **Usage:** `.setchatdelay <chat_id> <seconds>`")
-            return
-
-        try:
-            chat_id = int(message.command[1])
-            delay = int(message.command[2])
-        except ValueError:
-            await message.edit_text("❌ **Chat ID and delay must be integers!**")
-            return
-
-        res = await chats_col.update_one(
-            {"_id": chat_id},
-            {"$set": {"delay": delay}}
-        )
-        if res.matched_count > 0:
-            await message.edit_text(f"✅ **Updated delay for** `{chat_id}` **to** `{delay}s`")
-        else:
-            await message.edit_text(f"⚠️ **Chat** `{chat_id}` **not found in database.**")
-
-    @userbot.on_message(filters.outgoing & filters.command("setmsg", prefixes="."))
-    async def cmd_setmsg(client: Client, message: Message):
-        if len(message.command) < 2:
-            await message.edit_text("❌ **Usage:** `.setmsg <your_broadcast_text>`")
-            return
-
-        new_msg = message.text.split(maxsplit=1)[1]
-        await config_col.update_one(
-            {"_id": "global"},
-            {"$set": {"automsg_text": new_msg}},
-            upsert=True
-        )
-        await message.edit_text(f"✅ **Auto Broadcast Message updated:**\n\n{new_msg}")
-
-    @userbot.on_message(filters.outgoing & filters.command("automsg", prefixes="."))
-    async def cmd_automsg(client: Client, message: Message):
-        if len(message.command) < 2:
-            await message.edit_text("❌ **Usage:** `.automsg <on/off>`")
-            return
-
-        state = message.command[1].lower()
-        if state not in ["on", "off"]:
-            await message.edit_text("❌ **Choose either `on` or `off`.**")
-            return
-
-        is_on = (state == "on")
-        await config_col.update_one(
-            {"_id": "global"},
-            {"$set": {"automsg_enabled": is_on}},
-            upsert=True
-        )
-        status_text = "ENABLED 🚀" if is_on else "DISABLED 🛑"
-        await message.edit_text(f"🤖 **Auto Broadcast status:** `{status_text}`")
-
-    @userbot.on_message(filters.outgoing & filters.command("status", prefixes="."))
-    async def cmd_status(client: Client, message: Message):
-        cfg = await config_col.find_one({"_id": "global"}) or {}
-        fs = await fs_mgr.get_forcesub()
-        chat_count = await chats_col.count_documents({})
-
-        enabled = cfg.get("automsg_enabled", False)
-        automsg_text = cfg.get("automsg_text", "Not Set")
-
-        text = (
-            "📊 **System Status & Configuration**\n\n"
-            f"• **Auto Broadcast:** `{'ON' if enabled else 'OFF'}`\n"
-            f"• **ForceSub Channel:** `{fs if fs else 'Disabled'}`\n"
-            f"• **Target Chats Count:** `{chat_count}`\n"
-            f"• **Broadcast Text:**\n`{automsg_text}`"
-        )
-        await message.edit_text(text)
-
-    # ================= PM GUARD FOR USERBOT =================
-
-    @userbot.on_message(filters.private & ~filters.me & ~filters.bot)
-    async def userbot_pm_guard(client: Client, message: Message):
-        await fs_mgr.handle_pm_guard(client, message)
-
-    # ================= BOT API HANDLERS =================
-
-    @bot.on_message(filters.command("start"))
-    async def bot_start(client: Client, message: Message):
         user_id = message.from_user.id
-        fs = await fs_mgr.get_forcesub()
-        if fs:
-            is_sub = await fs_mgr.check_user_subscribed(client, fs, user_id)
-            if not is_sub:
-                await fs_mgr.handle_pm_guard(client, message)
-                return
+        unjoined = await fs_mgr.get_unjoined_channels(client, user_id)
 
-        await message.reply_text(
-            "👋 **Hello!**\n"
-            "This Telegram Bot API instance is active and synced with the Userbot.\n\n"
-            "Use `/help` to view available commands."
-        )
+        if unjoined:
+            try:
+                # Delete user message
+                await message.delete()
 
-    @bot.on_message(filters.command("help"))
-    async def bot_help(client: Client, message: Message):
-        await message.reply_text(
-            "ℹ️ **Bot API Help Menu**\n\n"
-            "• `/start` - Start the bot & verify subscription\n"
-            "• `/help` - Show this message\n"
-            "• `/status` - Check current broadcast status"
-        )
+                # Send temporary warning
+                msg_text = await fs_mgr.get_forcesub_text()
+                reply_markup = await fs_mgr.build_forcesub_markup(client, unjoined)
 
-    @bot.on_message(filters.command("status"))
-    async def bot_status(client: Client, message: Message):
-        cfg = await config_col.find_one({"_id": "global"}) or {}
-        chat_count = await chats_col.count_documents({})
-        enabled = cfg.get("automsg_enabled", False)
-        fs = await fs_mgr.get_forcesub()
+                warn_msg = await message.reply_text(
+                    f"⚠️ {message.from_user.mention}\n\n{msg_text}",
+                    reply_markup=reply_markup
+                )
 
-        await message.reply_text(
-            "📊 **Bot Status**\n\n"
-            f"• **Broadcast Active:** `{'YES' if enabled else 'NO'}`\n"
-            f"• **Target Chats:** `{chat_count}`\n"
-            f"• **ForceSub:** `{fs if fs else 'Disabled'}`"
-        )
+                # Auto-delete warning after 15s to keep group clean
+                await asyncio.sleep(15)
+                await warn_msg.delete()
+            except Exception as e:
+                logger.error(f"Group ForceSub error: {e}")
 
-    # Catch-all PM handler that DOES NOT block commands
-    @bot.on_message(filters.private & ~filters.command(["start", "help", "status"]))
-    async def bot_pm_catchall(client: Client, message: Message):
-        is_ok = await fs_mgr.handle_pm_guard(client, message)
-        if is_ok:
-            await message.reply_text("📥 Message received. Please use commands to interact.")
+    # --- PM ForceSub Guard & Owner PM Forwarder ---
+    @bot.on_message(filters.private & ~filters.me)
+    async def pm_forcesub_and_forwarder(client: Client, message: Message):
+        user_id = message.from_user.id
+        owner_id = userbot.me.id  # Automatically targets your personal account ID
+
+        # 1. Ignore messages sent by Owner
+        if user_id == owner_id:
+            return
+
+        # 2. Check ForceSub
+        unjoined = await fs_mgr.get_unjoined_channels(client, user_id)
+        if unjoined:
+            msg_text = await fs_mgr.get_forcesub_text()
+            reply_markup = await fs_mgr.build_forcesub_markup(client, unjoined)
+            await message.reply_text(msg_text, reply_markup=reply_markup)
+            return
+
+        # 3. ForceSub Passed -> Forward PM to Owner
+        try:
+            fwd = await message.forward(owner_id)
+            FORWARD_MAP[fwd.id] = user_id
+            
+            # Send notification header to owner
+            await bot.send_message(
+                owner_id,
+                f"📩 **New PM Message from:** {message.from_user.mention} (`{user_id}`)\n"
+                f"💡 *Reply to the forwarded message above to send a response back.*"
+            )
+        except Exception as e:
+            logger.error(f"Failed to forward PM to Owner ({owner_id}): {e}")
+
+    # --- Reply Back System (Owner replies to user from PM) ---
+    @userbot.on_message(filters.private & filters.outgoing & filters.reply)
+    async def reply_back_to_user(client: Client, message: Message):
+        reply_to_id = message.reply_to_message_id
+        if reply_to_id in FORWARD_MAP:
+            target_user_id = FORWARD_MAP[reply_to_id]
+            try:
+                await bot.send_message(target_user_id, message.text)
+                await message.reply_text(f"✅ **Reply sent to user** (`{target_user_id}`)")
+            except Exception as e:
+                await message.reply_text(f"❌ Failed to send reply: {e}")
