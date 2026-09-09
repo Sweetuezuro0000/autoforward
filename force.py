@@ -1,8 +1,8 @@
 import os
 import logging
-from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import UserNotParticipant, ChatAdminRequired, PeerIdInvalid, ChannelInvalid
+from hydrogram import Client, filters
+from hydrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from hydrogram.errors import UserNotParticipant, ChatAdminRequired, PeerIdInvalid, ChannelInvalid
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 logger = logging.getLogger(__name__)
